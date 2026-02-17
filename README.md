@@ -1,90 +1,157 @@
-# Obsidian Sample Plugin
+# Vault CRDT Sync
 
-This is a sample plugin for Obsidian (https://obsidian.md).
+Real-time Obsidian vault sync using [Yjs](https://yjs.dev/) CRDTs and [PartyKit](https://partykit.io/). Every markdown file is backed by a conflict-free replicated data type — edits merge automatically across devices with no last-write-wins conflicts.
 
-This project uses TypeScript to provide type checking and documentation.
-The repo depends on the latest plugin API (obsidian.d.ts) in TypeScript Definition format, which contains TSDoc comments describing what it does.
+## Features
 
-This sample plugin demonstrates some of the basic functionality the plugin API can do.
-- Adds a ribbon icon, which shows a Notice when clicked.
-- Adds a command "Open modal (simple)" which opens a Modal.
-- Adds a plugin setting tab to the settings page.
-- Registers a global click event and output 'click' to the console.
-- Registers a global interval which logs 'setInterval' to the console.
+- **Real-time sync** — Changes propagate instantly over WebSocket
+- **Conflict-free** — CRDT-based merging, not last-write-wins
+- **Offline-first** — Full offline support with IndexedDB persistence; syncs when reconnected
+- **Attachment sync** — Images, PDFs, and other files sync via R2 object storage (optional)
+- **Snapshots** — Daily automatic + on-demand backups to R2 with selective restore
+- **Remote cursors** — See where collaborators are editing (optional)
+- **Mobile support** — Works on Android/iOS with reconnection hardening
 
-## First time developing plugins?
+## Requirements
 
-Quick starting guide for new plugin devs:
+- Obsidian 1.5.0+
+- A sync server (see [Server setup](#server-setup))
+- For attachment sync / snapshots: R2 bucket configured on the server
 
-- Check if [someone already developed a plugin for what you want](https://obsidian.md/plugins)! There might be an existing plugin similar enough that you can partner up with.
-- Make a copy of this repo as a template with the "Use this template" button (login to GitHub if you don't see it).
-- Clone your repo to a local development folder. For convenience, you can place this folder in your `.obsidian/plugins/your-plugin-name` folder.
-- Install NodeJS, then run `npm i` in the command line under your repo folder.
-- Run `npm run dev` to compile your plugin from `main.ts` to `main.js`.
-- Make changes to `main.ts` (or create new `.ts` files). Those changes should be automatically compiled into `main.js`.
-- Reload Obsidian to load the new version of your plugin.
-- Enable plugin in settings window.
-- For updates to the Obsidian API run `npm update` in the command line under your repo folder.
+## Installation
 
-## Releasing new releases
+### Manual install (recommended for personal use)
 
-- Update your `manifest.json` with your new version number, such as `1.0.1`, and the minimum Obsidian version required for your latest release.
-- Update your `versions.json` file with `"new-plugin-version": "minimum-obsidian-version"` so older versions of Obsidian can download an older version of your plugin that's compatible.
-- Create new GitHub release using your new version number as the "Tag version". Use the exact version number, don't include a prefix `v`. See here for an example: https://github.com/obsidianmd/obsidian-sample-plugin/releases
-- Upload the files `manifest.json`, `main.js`, `styles.css` as binary attachments. Note: The manifest.json file must be in two places, first the root path of your repository and also in the release.
-- Publish the release.
+1. Download from the [latest release](https://github.com/kavinsood/do-sync/releases):
+   - `main.js`
+   - `manifest.json`
+   - `styles.css`
 
-> You can simplify the version bump process by running `npm version patch`, `npm version minor` or `npm version major` after updating `minAppVersion` manually in `manifest.json`.
-> The command will bump version in `manifest.json` and `package.json`, and add the entry for the new version to `versions.json`
+2. Create the plugin folder in your vault:
+   ```
+   <vault>/.obsidian/plugins/vault-crdt-sync/
+   ```
 
-## Adding your plugin to the community plugin list
+3. Copy the three files into that folder.
 
-- Check the [plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines).
-- Publish an initial version.
-- Make sure you have a `README.md` file in the root of your repo.
-- Make a pull request at https://github.com/obsidianmd/obsidian-releases to add your plugin.
+4. Restart Obsidian, then enable the plugin in **Settings → Community plugins**.
 
-## How to use
+To update: download new release files and replace the old ones.
 
-- Clone this repo.
-- Make sure your NodeJS is at least v16 (`node --version`).
-- `npm i` or `yarn` to install dependencies.
-- `npm run dev` to start compilation in watch mode.
+### Build from source
 
-## Manually installing the plugin
-
-- Copy over `main.js`, `styles.css`, `manifest.json` to your vault `VaultFolder/.obsidian/plugins/your-plugin-id/`.
-
-## Improve code quality with eslint
-- [ESLint](https://eslint.org/) is a tool that analyzes your code to quickly find problems. You can run ESLint against your plugin to find common bugs and ways to improve your code. 
-- This project already has eslint preconfigured, you can invoke a check by running`npm run lint`
-- Together with a custom eslint [plugin](https://github.com/obsidianmd/eslint-plugin) for Obsidan specific code guidelines.
-- A GitHub action is preconfigured to automatically lint every commit on all branches.
-
-## Funding URL
-
-You can include funding URLs where people who use your plugin can financially support it.
-
-The simple way is to set the `fundingUrl` field to your link in your `manifest.json` file:
-
-```json
-{
-    "fundingUrl": "https://buymeacoffee.com"
-}
+```bash
+git clone https://github.com/kavinsood/do-sync.git
+cd do-sync
+npm install
+npm run build
 ```
 
-If you have multiple URLs, you can also do:
+Copy `main.js`, `manifest.json`, and `styles.css` to your vault's plugin folder.
 
-```json
-{
-    "fundingUrl": {
-        "Buy Me a Coffee": "https://buymeacoffee.com",
-        "GitHub Sponsor": "https://github.com/sponsors",
-        "Patreon": "https://www.patreon.com/"
-    }
-}
+## Configuration
+
+After enabling, go to **Settings → Vault CRDT sync**:
+
+| Setting | Description |
+|---------|-------------|
+| **Server host** | Your server URL (e.g., `https://sync.yourdomain.com`) |
+| **Token** | Shared secret — must match `SYNC_TOKEN` on the server |
+| **Vault ID** | Unique ID for this vault (auto-generated if blank). Same ID = same vault across devices. |
+| **Device name** | Shown in remote cursors |
+
+### Optional settings
+
+| Setting | Description |
+|---------|-------------|
+| **Exclude patterns** | Comma-separated prefixes to skip (e.g., `templates/, .trash/`) |
+| **Max file size** | Skip files larger than this (default 2 MB) |
+| **External edit policy** | How to handle edits from git/other tools: Always, Only when closed, Never |
+| **Sync attachments** | Enable R2-based sync for non-markdown files |
+| **Show remote cursors** | Display collaborator cursor positions |
+| **Debug logging** | Verbose console output |
+
+Changes to host/token/vault ID require reloading the plugin.
+
+## Commands
+
+Access via command palette (Ctrl/Cmd+P):
+
+| Command | Description |
+|---------|-------------|
+| **Reconnect to sync server** | Force reconnect after network changes |
+| **Force reconcile** | Re-merge disk state with CRDT |
+| **Show sync debug info** | Connection state, file counts, queue status |
+| **Take snapshot now** | Create an immediate backup to R2 |
+| **Browse and restore snapshots** | View snapshots, diff against current state, selective restore |
+| **Reset local cache** | Clear IndexedDB, re-sync from server |
+| **Nuclear reset** | Wipe all CRDT state everywhere, re-seed from disk |
+
+## Snapshots
+
+Snapshots are point-in-time backups of your vault's CRDT state, stored in R2.
+
+- **Daily automatic**: A snapshot is taken automatically once per day when Obsidian opens
+- **On-demand**: Use "Take snapshot now" before risky operations (AI refactors, bulk edits)
+- **Selective restore**: Browse snapshots, see a diff of what changed, restore individual files
+- **Undelete**: Restore files that were deleted since the snapshot
+- **Pre-restore backup**: Before restoring, current file content is saved to `.obsidian/plugins/vault-crdt-sync/restore-backups/`
+
+Requires R2 to be configured on the server.
+
+## Mobile (Android/iOS)
+
+The plugin works on mobile with some considerations:
+
+- **Reconnection**: Automatically reconnects when the app resumes from background
+- **Battery**: Reduce "Concurrent transfers" in settings to lower battery use during attachment sync
+- **Large vaults**: Initial sync may take longer; subsequent syncs are incremental
+- **Offline**: Full offline editing works; changes sync when back online
+
+If sync seems stuck after switching networks, use "Reconnect to sync server" from the command palette.
+
+## Server setup
+
+The plugin needs a PartyKit server. See **[server/README.md](server/README.md)** for:
+
+- Local development setup
+- Deploy to PartyKit (managed hosting)
+- Deploy to your own Cloudflare account
+- R2 bucket setup for attachments and snapshots
+- Secret management and rotation
+
+## How it works
+
+1. Each markdown file gets a stable ID and a `Y.Text` CRDT for its content
+2. Edits flow through the Yjs binding to the Y.Doc
+3. The PartyKit server relays updates to all connected devices
+4. Updates are persisted in Durable Object storage (survives server restarts)
+5. Offline edits are stored in IndexedDB and sync on reconnect
+6. Attachments sync separately via content-addressed R2 storage
+
+## Releasing
+
+Releases are automated. To cut a release:
+
+```bash
+npm version patch  # or minor/major
+git push --follow-tags
 ```
 
-## API Documentation
+The workflow builds and attaches `main.js`, `manifest.json`, `styles.css` to a GitHub Release.
 
-See https://docs.obsidian.md
+## Troubleshooting
+
+**"Unauthorized" errors**: Token mismatch between plugin and server. Check both match exactly.
+
+**"R2 not configured"**: Server doesn't have R2 env vars. See server README for setup.
+
+**Sync stops on mobile**: Use "Reconnect to sync server" command. Check you have network connectivity.
+
+**Files not syncing**: Check exclude patterns. Files over max size are skipped. Use debug logging to see what's happening.
+
+**Conflicts after offline edits**: CRDTs merge automatically but the result depends on operation order. Review merged content if needed.
+
+## License
+
+[0-BSD](LICENSE)
