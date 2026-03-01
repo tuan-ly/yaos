@@ -4,6 +4,7 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import { normalizePath } from "obsidian";
 import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone, ORIGIN_SEED } from "../types";
 import type { VaultSyncSettings } from "../settings";
+import type { TraceHttpContext, TraceRecord } from "../debug/trace";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 const SCHEMA_VERSION = 1;
@@ -89,10 +90,19 @@ export class VaultSync {
 
 	private readonly _device: string | undefined;
 	private readonly debug: boolean;
+	private _eventRing: Array<{ ts: string; msg: string }> = [];
+	private readonly trace?: TraceRecord;
 
-	constructor(settings: VaultSyncSettings) {
+	constructor(
+		settings: VaultSyncSettings,
+		options?: {
+			traceContext?: TraceHttpContext;
+			trace?: TraceRecord;
+		},
+	) {
 		this.debug = settings.debug;
 		this._device = settings.deviceName || undefined;
+		this.trace = options?.trace;
 
 		this.ydoc = new Y.Doc();
 		this.pathToId = this.ydoc.getMap<string>("pathToId");
@@ -122,14 +132,25 @@ export class VaultSync {
 				console.error("[vault-crdt-sync] IndexedDB failed to open:", err);
 			});
 
+		const params: Record<string, string> = { token: settings.token };
+		if (options?.traceContext) {
+			params.device = options.traceContext.deviceName;
+			params.trace = options.traceContext.traceId;
+			params.boot = options.traceContext.bootId;
+		}
+
 		this.provider = new YPartyKitProvider(settings.host, roomId, this.ydoc, {
-			params: { token: settings.token },
+			params,
 			connect: true,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
 		});
 
 		// Track connection generations for reconnect detection
 		this.provider.on("status", (event: { status: string }) => {
+			this.log(
+				`Provider status=${event.status} ` +
+				`(wsconnected=${this.provider.wsconnected}, synced=${this.provider.synced})`,
+			);
 			if (event.status === "connected") {
 				this._connectionGeneration++;
 				this.log(`Connection generation: ${this._connectionGeneration}`);
@@ -202,6 +223,7 @@ export class VaultSync {
 			}, PROVIDER_SYNC_TIMEOUT_MS);
 
 			const check = (synced: boolean) => {
+				this.log(`Provider sync event: synced=${synced} (gen=${this._connectionGeneration})`);
 				if (!synced) return;
 				clearTimeout(timeout);
 				this._providerSynced = true;
@@ -222,6 +244,7 @@ export class VaultSync {
 		this.provider.on("sync", (synced: boolean) => {
 			if (!synced) return;
 			this._providerSynced = true;
+			this.log(`onProviderSync callback firing (gen=${this._connectionGeneration})`);
 			callback(this._connectionGeneration);
 		});
 	}
@@ -417,10 +440,12 @@ export class VaultSync {
 
 	reconcileVault(
 		diskFiles: Map<string, string>,
+		diskPresentPaths: Set<string>,
 		mode: ReconcileMode,
 		device?: string,
 	): ReconcileResult {
 		const createdOnDisk: string[] = [];
+		const updatedOnDisk: string[] = [];
 		const seededToCrdt: string[] = [];
 		const untracked: string[] = [];
 		let skipped = 0;
@@ -441,14 +466,31 @@ export class VaultSync {
 		});
 
 		// CRDT files not on disk → create on disk
+		// IMPORTANT: use diskPresentPaths (all known disk paths), not
+		// diskFiles (only the subset whose content was read this run).
 		for (const path of crdtPaths) {
-			if (!diskFiles.has(path)) {
+			if (!diskPresentPaths.has(path)) {
 				createdOnDisk.push(path);
 			}
 		}
 
+		// Files present in both disk and CRDT whose content differs.
+		// In authoritative mode, CRDT is source of truth and should be
+		// flushed to disk so reopened clients converge reliably.
+		if (mode === "authoritative") {
+			for (const [path, diskContent] of diskFiles) {
+				if (!crdtPaths.has(path)) continue;
+				const ytext = this.getTextForPath(path);
+				if (!ytext) continue;
+				const crdtContent = ytext.toString();
+				if (crdtContent !== diskContent) {
+					updatedOnDisk.push(path);
+				}
+			}
+		}
+
 		// Disk files not in CRDT
-		for (const [path, content] of diskFiles) {
+		for (const path of diskPresentPaths) {
 			if (crdtPaths.has(path)) continue;
 
 			let wasTombstoned = false;
@@ -465,6 +507,13 @@ export class VaultSync {
 			}
 
 			if (mode === "authoritative") {
+				const content = diskFiles.get(path);
+				if (content === undefined) {
+					// Presence is known, but content wasn't read this pass. Skip seeding
+					// to avoid accidentally creating empty/incorrect files.
+					this.log(`reconcile: "${path}" present on disk but content not loaded, skipping seed`);
+					continue;
+				}
 				this.ensureFile(path, content, device);
 				seededToCrdt.push(path);
 			} else {
@@ -480,11 +529,12 @@ export class VaultSync {
 			`reconcile [${mode}]: ` +
 			`${seededToCrdt.length} seeded, ` +
 			`${createdOnDisk.length} need disk creation, ` +
+			`${updatedOnDisk.length} need disk update, ` +
 			`${untracked.length} untracked, ` +
 			`${skipped} tombstoned`,
 		);
 
-		return { mode, createdOnDisk, seededToCrdt, untracked, skipped };
+		return { mode, createdOnDisk, updatedOnDisk, seededToCrdt, untracked, skipped };
 	}
 
 	// -------------------------------------------------------------------
@@ -502,35 +552,44 @@ export class VaultSync {
 	ensureFile(path: string, currentContent: string, device?: string): Y.Text | null {
 		path = this.normPath(path);
 
-		// Check tombstones — never resurrect a deleted file
-		let tombstoned = false;
-		this.meta.forEach((meta) => {
-			if (meta.path === path && meta.deleted) {
-				tombstoned = true;
-			}
-		});
-		if (tombstoned) {
-			this.log(`ensureFile: "${path}" is tombstoned, refusing to create`);
-			return null;
-		}
-
 		const existingId = this.pathToId.get(path);
-		if (existingId) {
-			const existingText = this.idToText.get(existingId);
+		if (!existingId) {
+			this.promotePendingRenameTarget(path, device);
+		}
+		const resolvedId = this.pathToId.get(path);
+		if (resolvedId) {
+			const existingText = this.idToText.get(resolvedId);
 			if (existingText) {
-				this.log(`ensureFile: "${path}" already exists (id=${existingId})`);
-				this._textToFileId.set(existingText, existingId);
+				const cleared = this.clearMarkdownTombstonesForPath(path, resolvedId);
+				if (cleared > 0) {
+					this.log(`ensureFile: cleared ${cleared} stale tombstone(s) for "${path}"`);
+				}
+				this.log(`ensureFile: "${path}" already exists (id=${resolvedId})`);
+				this._textToFileId.set(existingText, resolvedId);
 				return existingText;
 			}
 			// Orphaned mapping — clean up old entries before recreating
 			this.log(
-				`ensureFile: "${path}" has id=${existingId} but no Y.Text — cleaning up orphan`,
+				`ensureFile: "${path}" has id=${resolvedId} but no Y.Text — cleaning up orphan`,
 			);
 			this.ydoc.transact(() => {
 				this.pathToId.delete(path);
-				this.idToText.delete(existingId);
-				this.meta.delete(existingId);
+				this.idToText.delete(resolvedId);
+				this.meta.delete(resolvedId);
 			}, ORIGIN_SEED);
+		}
+
+		// Check tombstones — never resurrect a deleted path unless it is already
+		// backed by a live pathToId entry handled above.
+		const tombstoneIds = this.getMarkdownTombstoneIds(path);
+		if (tombstoneIds.length > 0) {
+			this.trace?.("sync", "ensureFile-tombstone-blocked", {
+				path,
+				tombstoneIds,
+				device: device ?? null,
+			});
+			this.log(`ensureFile: "${path}" is tombstoned, refusing to create`);
+			return null;
 		}
 
 		const fileId = this.generateFileId();
@@ -550,6 +609,10 @@ export class VaultSync {
 		this.log(`ensureFile: created "${path}" (id=${fileId})`);
 		this._textToFileId.set(ytext, fileId);
 		return ytext;
+	}
+
+	isMarkdownTombstoned(path: string): boolean {
+		return this.getMarkdownTombstoneIds(path).length > 0;
 	}
 
 	getTextForPath(path: string): Y.Text | null {
@@ -715,6 +778,16 @@ export class VaultSync {
 		this._renameTimer = setTimeout(() => this.flushRenameBatch(), RENAME_BATCH_MS);
 	}
 
+	isPendingRenameTarget(path: string): boolean {
+		path = this.normPath(path);
+		for (const [, newPath] of this._renameBatch) {
+			if (newPath === path) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/**
 	 * Register a callback invoked after each rename batch flush.
 	 * Receives the map of old→new paths that were applied.
@@ -731,39 +804,7 @@ export class VaultSync {
 		this._renameBatch.clear();
 
 		this.log(`Flushing rename batch: ${batch.size} renames`);
-
-		this.ydoc.transact(() => {
-			for (const [oldPath, newPath] of batch) {
-				// Handle markdown renames (pathToId)
-				const fileId = this.pathToId.get(oldPath);
-				if (fileId) {
-					this.pathToId.delete(oldPath);
-					this.pathToId.set(newPath, fileId);
-					this.meta.set(fileId, {
-						path: newPath,
-						mtime: Date.now(),
-						device: this._device,
-					});
-
-					this.log(`renameBatch: "${oldPath}" -> "${newPath}" (id=${fileId})`);
-				}
-
-				// Handle blob renames (pathToBlob)
-				const blobRef = this.pathToBlob.get(oldPath);
-				if (blobRef) {
-					this.pathToBlob.delete(oldPath);
-					this.pathToBlob.set(newPath, blobRef);
-					// Clear any tombstone at the new path
-					if (this.blobTombstones.has(newPath)) {
-						this.blobTombstones.delete(newPath);
-					}
-					this.log(`renameBatch: blob "${oldPath}" -> "${newPath}"`);
-				}
-			}
-		}, ORIGIN_SEED);
-
-		// Notify caller (main.ts) so it can rebind editors
-		this._onRenameBatchFlushed?.(batch);
+		this.applyRenameBatch(batch, this._device);
 	}
 
 	/** Direct single rename (kept for programmatic use). */
@@ -780,6 +821,7 @@ export class VaultSync {
 		this.ydoc.transact(() => {
 			this.pathToId.delete(oldPath);
 			this.pathToId.set(newPath, fileId);
+			this.clearMarkdownTombstonesForPath(newPath, fileId);
 			this.meta.set(fileId, {
 				path: newPath,
 				mtime: Date.now(),
@@ -788,6 +830,91 @@ export class VaultSync {
 		}, ORIGIN_SEED);
 
 		this.log(`handleRename: "${oldPath}" -> "${newPath}" (id=${fileId})`);
+	}
+
+	private promotePendingRenameTarget(path: string, device?: string): void {
+		const normalizedPath = this.normPath(path);
+		let pendingOldPath: string | null = null;
+		for (const [oldPath, newPath] of this._renameBatch) {
+			if (newPath === normalizedPath) {
+				pendingOldPath = oldPath;
+				break;
+			}
+		}
+		if (!pendingOldPath) return;
+
+		this._renameBatch.delete(pendingOldPath);
+		if (this._renameBatch.size === 0 && this._renameTimer) {
+			clearTimeout(this._renameTimer);
+			this._renameTimer = null;
+		}
+
+		const batch = new Map([[pendingOldPath, normalizedPath]]);
+		this.log(`Promoting pending rename target: "${pendingOldPath}" -> "${normalizedPath}"`);
+		this.applyRenameBatch(batch, device ?? this._device);
+	}
+
+	private applyRenameBatch(batch: Map<string, string>, device?: string): void {
+		if (batch.size === 0) return;
+
+		this.ydoc.transact(() => {
+			for (const [oldPath, newPath] of batch) {
+				const fileId = this.pathToId.get(oldPath);
+				if (fileId) {
+					this.pathToId.delete(oldPath);
+					this.pathToId.set(newPath, fileId);
+					this.clearMarkdownTombstonesForPath(newPath, fileId);
+					this.meta.set(fileId, {
+						path: newPath,
+						mtime: Date.now(),
+						device,
+					});
+					this.log(`renameBatch: "${oldPath}" -> "${newPath}" (id=${fileId})`);
+				}
+
+				const blobRef = this.pathToBlob.get(oldPath);
+				if (blobRef) {
+					this.pathToBlob.delete(oldPath);
+					this.pathToBlob.set(newPath, blobRef);
+					if (this.blobTombstones.has(newPath)) {
+						this.blobTombstones.delete(newPath);
+					}
+					this.log(`renameBatch: blob "${oldPath}" -> "${newPath}"`);
+				}
+			}
+		}, ORIGIN_SEED);
+
+		this._onRenameBatchFlushed?.(batch);
+	}
+
+	private clearMarkdownTombstonesForPath(path: string, keepFileId?: string): number {
+		const tombstonedIds: string[] = [];
+		this.meta.forEach((meta, fileId) => {
+			if (
+				fileId !== keepFileId
+				&& meta.path === path
+				&& meta.deleted
+			) {
+				tombstonedIds.push(fileId);
+			}
+		});
+
+		for (const tombstonedId of tombstonedIds) {
+			this.meta.delete(tombstonedId);
+		}
+
+		return tombstonedIds.length;
+	}
+
+	private getMarkdownTombstoneIds(path: string): string[] {
+		const normalizedPath = this.normPath(path);
+		const tombstonedIds: string[] = [];
+		this.meta.forEach((meta, fileId) => {
+			if (meta.path === normalizedPath && meta.deleted) {
+				tombstonedIds.push(fileId);
+			}
+		});
+		return tombstonedIds;
 	}
 
 	handleDelete(path: string, device?: string): void {
@@ -803,6 +930,12 @@ export class VaultSync {
 		for (const [oldPath, newPath] of this._renameBatch) {
 			if (newPath === path) {
 				// Case 1: delete target is the rename destination
+				this.trace?.("sync", "delete-cancelled-pending-rename", {
+					requestedPath: path,
+					pendingOldPath: oldPath,
+					pendingNewPath: newPath,
+					case: "rename-target",
+				});
 				this.log(`handleDelete: "${path}" is a pending rename target from "${oldPath}" — cancelling rename`);
 				this._renameBatch.delete(oldPath);
 				resolvedPath = oldPath;
@@ -810,6 +943,12 @@ export class VaultSync {
 			}
 			if (oldPath === path) {
 				// Case 2: delete target is the rename source
+				this.trace?.("sync", "delete-cancelled-pending-rename", {
+					requestedPath: path,
+					pendingOldPath: oldPath,
+					pendingNewPath: newPath,
+					case: "rename-source",
+				});
 				this.log(`handleDelete: "${path}" has pending rename to "${newPath}" — cancelling rename`);
 				this._renameBatch.delete(oldPath);
 				resolvedPath = path;
@@ -837,6 +976,13 @@ export class VaultSync {
 				device,
 			});
 		}, ORIGIN_SEED);
+
+		this.trace?.("sync", "markdown-tombstoned", {
+			requestedPath: path,
+			resolvedPath,
+			fileId,
+			device: device ?? null,
+		});
 
 		this.log(`handleDelete: "${resolvedPath}" marked deleted (id=${fileId})`);
 	}
@@ -938,7 +1084,39 @@ export class VaultSync {
 		this.ydoc.destroy();
 	}
 
+	getRecentEvents(limit = 120): Array<{ ts: string; msg: string }> {
+		if (limit <= 0) return [];
+		return this._eventRing.slice(-limit);
+	}
+
+	getDebugSnapshot(): {
+		connected: boolean;
+		providerSynced: boolean;
+		localReady: boolean;
+		connectionGeneration: number;
+		fatalAuthError: boolean;
+		idbError: boolean;
+		pathToIdCount: number;
+		blobPathCount: number;
+	} {
+		return {
+			connected: this.connected,
+			providerSynced: this.providerSynced,
+			localReady: this.localReady,
+			connectionGeneration: this.connectionGeneration,
+			fatalAuthError: this.fatalAuthError,
+			idbError: this.idbError,
+			pathToIdCount: this.pathToId.size,
+			blobPathCount: this.pathToBlob.size,
+		};
+	}
+
 	private log(msg: string): void {
+		this._eventRing.push({ ts: new Date().toISOString(), msg });
+		if (this._eventRing.length > 600) {
+			this._eventRing.splice(0, this._eventRing.length - 600);
+		}
+		this.trace?.("sync", msg);
 		if (this.debug) {
 			console.log(`[vault-crdt-sync] ${msg}`);
 		}
@@ -948,6 +1126,7 @@ export class VaultSync {
 export interface ReconcileResult {
 	mode: ReconcileMode;
 	createdOnDisk: string[];
+	updatedOnDisk: string[];
 	seededToCrdt: string[];
 	untracked: string[];
 	skipped: number;
