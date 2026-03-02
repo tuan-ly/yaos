@@ -7,8 +7,8 @@
 
 # npm / bun
 node_modules
-package-lock.json
-!server/package-lock.json
+bun.lock
+server/bun.lock
 
 # Don't include the compiled main.js file in the repo.
 # They should be uploaded to GitHub releases instead.
@@ -27,4 +27,6 @@ data.json
 server/node_modules
 server/dist
 server/.env
+.wrangler
 server/.partykit
+server/.wrangler
