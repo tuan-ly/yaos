@@ -1,13 +1,13 @@
 {
 	"name": "yaos",
 	"version": "0.2.0",
-	"description": "Real-time collaborative vault sync across devices using Yjs CRDTs and Cloudflare Workers.",
+	"description": "Real-time collaborative Obsidian sync across devices using Yjs CRDTs and Cloudflare Durable Objects.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-		"test:regressions": "node --import jiti/register tests/diff-regressions.mjs && node tests/disk-mirror-regressions.mjs && node tests/markdown-ingest-regressions.mjs && node --import jiti/register tests/closed-file-mirror.ts && node --import jiti/register tests/folder-rename.ts",
+		"test:regressions": "node --import jiti/register tests/diff-regressions.mjs && node tests/disk-mirror-regressions.mjs && node tests/markdown-ingest-regressions.mjs && node --import jiti/register tests/closed-file-mirror.ts && node --import jiti/register tests/folder-rename.ts && node --import jiti/register tests/chunked-doc-store.ts",
 		"test:integration:worker": "node tests/worker-integration.mjs",
 		"test:ci": "npm run test:regressions && npm run test:integration:worker",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
@@ -24,7 +24,7 @@
 		"eslint-plugin-obsidianmd": "0.1.9",
 		"globals": "14.0.0",
 		"jiti": "2.6.1",
-		"tslib": "2.4.0",
+		"tslib": "^2.4.0",
 		"typescript": "^5.8.3",
 		"typescript-eslint": "8.35.1",
 		"ws": "^8.19.0"
