@@ -5,19 +5,6 @@ It is intentionally fact-first: hard constraints, current implementation truth, 
 
 Maintaining one vault-level `Y.Doc` gives strong cross-file transactional behavior, but it also means persistence must handle a large binary state graph on infrastructure with strict per-entry limits. YAOS addresses this with a checkpoint + journal storage engine rather than single-value rewrites.
 
-## Core limits (as of March 4, 2026)
-
-- Soft plugin limit (per markdown file): `maxFileSizeKB`, default `2048` KB (2 MB).
-- Durable Object storage API limit (key + value): 2 MB per entry.
-- Worker WebSocket message limit (received): 32 MiB.
-
-For SQLite-backed Durable Objects, Cloudflare currently documents:
-
-- 10 GB storage per Durable Object (paid plan baseline).
-- Free-plan storage/account limits still apply.
-
-These platform limits can change. Re-verify against Cloudflare docs before relying on exact numbers in design decisions.
-
 ## Current server persistence model
 
 YAOS keeps a monolithic vault-level `Y.Doc` in memory, but persistence is no longer a single-value rewrite:
@@ -41,13 +28,13 @@ Order-of-magnitude effect:
 
 ## Practical ceilings (what hurts first)
 
-Chunking removes the old single-value bottleneck, but very large vaults are still constrained by:
+Very large vaults are still constrained by:
 
 - CPU cost for `Y.encodeStateAsUpdate()` and merge/apply work.
 - Durable Object memory pressure on cold start/replay.
 - Client-side parse/apply latency (especially mobile), even if transport limits are higher.
 
-In practice, compute and memory behavior usually become the first bottlenecks before raw storage capacity.
+In practice, compute and memory behavior usually become the first bottlenecks before raw storage capacity for CRDTs.
 
 ## Safety invariants
 

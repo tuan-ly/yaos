@@ -1,24 +1,6 @@
 # Attachment Sync: Content-Addressing and Bounded Fan-Out
 
-Markdown text belong in the CRDT. Images, PDFs and other binary file-types are handled via a separate, content-addressed blob synchronization pipeline backed by Cloudflare R2 object storage.
-
-### The Framework Migration: PartyKit to Native Workers
-
-The first version of YAOS was built on Partykit. PartyKit provided an incredible early abstraction - it wrapped Cloudflare's complex Durable Objects behind a simple "Room" API and made real-time multiplayer trivially easy to bootstrap.
-
-Partykit supports deploying to your own Cloudflare account, so you control your data, the server, and Cloudflare's generous limits should easily cover a personal usecase.
-
-However the deployment works through their proprietary CLI. The problem is that running partykit inside a wrangler based project is not supported at this time, so you cannot set-up a "One Click Deployment" for users. They must login through partykit-cli to deploy.
-
-This violated our core onboarding goal: Zero-terminal, consumer-grade self-hosting.
-
-To unlock Cloudflare's magical "Deploy to Cloudflare" one-click button, we stripped out the PartyKit framework and ported the entire transport layer to raw Cloudflare Workers using y-partyserver. This allowed us to define the entire infrastructure (Workers, Durable Objects, and Storage) in a standard wrangler.toml file, eliminating the CLI entirely.
-
-Cloudflare acquired Partykit in 2024. They didn't buy it to keep maintaining a separate partykit deploy CLI wrapper. They bought it to rip out the underlying Durable Objects synchronization math and bake it natively into Cloudflare Workers.
-
-That is exactly what `partyserver` and `y-partyserver` are. They are the native, officially supported Cloudflare Worker libraries.
-
-The fact that PartyKit's old docs still say "Run inside a wrangler project: Future Development" is just typical documentation rot. The marketing site is abandoned, but the engineering team has already shipped the replacement on npm.
+Markdown text belongs in the CRDT. Images, PDFs and other binary file-types are handled via a separate, content-addressed blob synchronization pipeline backed by Cloudflare R2 object storage.
 
 ### The Native Worker Proxy
 
@@ -31,16 +13,6 @@ We deleted that brittle state machine. YAOS now utilizes direct native R2 bindin
 This native proxy approach drastically simplifies the client logic, eliminates the need for external `aws4fetch` signing libraries, and completely removes the need to parse S3 XML responses.
 
 ![Attachment upload lifecycle: presigned S3 flow vs native Worker proxy](./diagrams/attachment-upload-lifecycle-presigned-s3-flow-vs-native-worker-proxy.webp)
-
-### The Credit Card Wall (Optional R2 Provisioning)
-
-Because YAOS utilizes native `wrangler.toml` bindings, Cloudflare can automatically provision Durable Objects and R2 buckets upon deployment. This enables the holy  one-click "Deploy to Cloudflare" button.
-
-However, we made the intentional product decision **not** to force the R2 bucket binding in the default deployment template.
-
-While R2 has a generous free tier, Cloudflare enforces a strict requirement: users must have a primary payment method (credit card) on file to provision an R2 bucket. If YAOS required this binding by default, the "Deploy to Cloudflare" button would fail for any user without a configured billing profile, hampering our slick "One Click Deployment".
-
-Instead, YAOS degrades gracefully. The default deployment provisions only the text-sync CRDT engine. The server exposes a `/api/capabilities` endpoint. If the R2 bucket is unbound, the server reports `{ attachments: false }`, and the Obsidian plugin cleanly disables the attachment sync UI. Power users can explicitly enable R2 later via the Cloudflare Dashboard in **one-step (Just add an R2 binding to the Worker)** to unlock attachment and snapshot capabilities.
 
 ### Bounding the Cloudflare Fan-Out
 
@@ -62,31 +34,26 @@ Moreover, building this in JS would be really inefficient. Bandwidth is cheap; d
 
 ![Why YAOS avoids block-level chunking](./diagrams/why-yaos-avoids-block-level-chunking.webp)
 
+## Blob Sync Queues
+
+Attachment synchronization in YAOS intentionally avoids complex asynchronous scheduling in favor of a simple batch-based queue.
+
+If a user uploads a 50MB video and a 50KB image in the same batch, the image file waits for the video to finish before the *next* batch can start.
+
+This is a deliberate design choice prioritizing stability over maximal throughput. We did not build an asynchronous lock-free worker pool with exponential backoff and persistent state reconciliation. These are notorious for introducing subtle retry and resume bugs.
+
+Because disk writes now run through a universal per-path lock, blob sync is primarily a throughput and backpressure concern, not a core text-correctness concern.
+
+We use the network bandwidth slightly less efficiently because of batch boundaries, though
+
+- It doesn't permanently leak concurrency slots.
+- It doesn't create race conditions between the in-memory queue and the IndexedDB persisted state.
+- It doesn't re-order operations in a way that breaks your expected timeline.
+
+This can be worked on, if we care about high blob I/O.
+
 ### Hardened Upload Limits and Integrity
 
 To protect the server infrastructure and prevent accidental giant uploads from generating needless bandwidth churn, the server enforces a hard maximum upload size of 10 MB on the Worker proxy route. This explicitly matches the plugin's default attachment policy. (This cap applies exclusively to blob attachments, not to the live CRDT WebSocket stream or server-side snapshot creation). This can be easily increased.
 
 Finally, to ensure absolute integrity of the snapshot safety net, snapshot IDs are generated using cryptographic randomness rather than predictable `Math.random()` calls.
-
-## Snapshot Semantics and The Recovery Model
-
-Sync is nice. Recovery is the real reason you self-host your data.
-
-Obsidian's local File Recovery plugin is excellent for small "oops" moments (like accidentally deleting a paragraph). YAOS does not try to replace it. YAOS snapshots are designed for catastrophic recovery: "I accidentally wiped my folder structure and need to intelligently restore the vault to yesterday's state."
-
-Snapshots are the operational safety-net for the CRDT graph, not a second attachment transport. YAOS serializes the full Y.Doc state, gzips the payload, and writes two objects to R2:
-- crdt.bin.gz (the compressed CRDT state)
-- index.json (snapshot metadata and blob references)
-
-The key design point: Snapshot creation does not duplicate blob bytes.
-
-If snapshots copied full binary payloads each time, a daily snapshot would explode storage costs for vaults with large static media. Instead, the index.json acts as a point-in-time manifest. It records the content hashes currently referenced by the CRDT (pathToBlob). Because R2 attachments are content-addressed, this provides inherent deduplication.
-
-At restore time, the CRDT state is authoritative. The plugin applies the restored graph, reconstructing the exact folder structure and text, and then reconciles attachment files by pulling the missing hash pointers from R2.
-
-A few invariants keep this model correct under failure:
-- Snapshot IDs are generated using cryptographic randomness, not Math.random().
-- Snapshot operations share the exact same storage substrate as blob sync. If R2 is unbound, snapshots are disabled entirely (snapshots: false), preventing ambiguous recovery guarantees.
-- Missing blob objects during restore are surfaced as localized data gaps, not silent structural failures.
-
-The result is a system where text collaboration remains real-time and cheap, attachment sync remains content-addressed, and snapshots provide deterministic vault recovery without introducing a second complex storage engine.

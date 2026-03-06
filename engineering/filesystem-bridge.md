@@ -36,7 +36,7 @@ We stopped reacting to every filesystem tick.
 
 2. Outbound (CRDT -> Disk): Per-Path Serialization
 
-- Outbound writes from the CRDT to the disk now pass through a strict promise chain lock. 
+- Outbound writes from the CRDT to the disk now pass through a strict promise chain lock.
 - This ensures that the same file cannot be written concurrently by overlapping paths, making it impossible for overlapping network syncs to trigger concurrent flushes to the same file.
 
 3. State-Acknowledged Suppression

@@ -1,8 +1,6 @@
 # Checkpoint & Journal Architecture
 
-This document captures the persistence rewrite that moved YAOS from "prototype that works" to "system that survives scale and hibernation."
-
-The high-level constraint never changed: YAOS keeps a monolithic vault-level `Y.Doc` to preserve cross-file transactional behavior. The storage model changed completely.
+A naive CRDT persistence layer rewrites the entire state graph on every save. To avoid catastrophic write-amplification, YAOS implements a checkpoint and journal architecture.
 
 ## Migration reality check (PartyKit -> y-partyserver)
 
@@ -18,27 +16,9 @@ During the migration to `y-partyserver`, we initially assumed those durability m
 
 `y-partyserver` gives us transport, room wiring, and debounced `onSave()` / `onLoad()` hooks. It does not provide built-in chunked persistence, checkpoint manifests, journal compaction, or state-vector anchoring. Once we verified this at the implementation level, the risk became clear: we were one step away from full-state rewrites on each save and the exact write-amplification failure mode that kills CRDT deployments at scale.
 
-This was the architectural inflection point: we stopped treating persistence like plugin glue code and treated it like a storage engine problem. In practice, this was the "final boss" of CRDT scaling: write amplification plus hibernation-safe state-vector recovery.
-
-## Why this rewrite happened
-
-The previous persistence path wrote the full encoded vault state on each save.
-
-That was a hard scaling hazard:
-
-- one tiny edit could trigger a full-state rewrite
-- write amplification grew with vault size
-- a single-value persistence model eventually hits Durable Object entry limits
-
 We also validated framework behavior directly: `y-partyserver` gives us `onLoad()` / `onSave()` hooks, but it does not provide automatic persistence chunking like older PartyKit flows.
 
-## The 2 MiB dealbreaker phase
-
-The failure mode was straightforward: if a vault's encoded CRDT state outgrew a single Durable Object storage entry, persistence would fail at write time.
-
-For a single huge note, this can be an edge case. For an entire vault, it is a dealbreaker.
-
-That was the moment the architecture had to evolve from "sync plugin persistence" into a proper checkpointing and journaling engine.
+This was the architectural inflection point: we stopped treating persistence like plugin glue code and treated it like a storage engine problem. In practice, this was the "final boss" of CRDT scaling: write amplification plus hibernation-safe state-vector recovery.
 
 ## What we built
 
