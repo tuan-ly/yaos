@@ -1,5 +1,5 @@
 import { Compartment, type Extension } from "@codemirror/state";
-import { EditorView, type ViewUpdate } from "@codemirror/view";
+import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { yCollab, ySyncFacet } from "y-codemirror.next";
 import * as Y from "yjs";
 import { Notice, type MarkdownView } from "obsidian";
@@ -86,6 +86,7 @@ export class EditorBindingManager {
 
 	/** Track which views are currently bound. Keyed by MarkdownView leaf id. */
 	private bindings = new Map<string, EditorBinding>();
+	private knownCmViews = new Set<EditorView>();
 	private cmIds = new WeakMap<EditorView, string>();
 	private cmToLeafId = new WeakMap<EditorView, string>();
 	private cmCounter = 0;
@@ -109,11 +110,24 @@ export class EditorBindingManager {
 	 * Starts as empty; reconfigured per-editor when a note is opened.
 	 */
 	getBaseExtension(): Extension {
+		const manager = this;
 		return [
 			this.compartment.of([]),
-			EditorView.updateListener.of((update: ViewUpdate) => {
-				this.handleLiveEditorUpdate(update);
-			}),
+			ViewPlugin.fromClass(
+				class {
+					constructor(readonly view: EditorView) {
+						manager.registerKnownCmView(view);
+					}
+
+					update(update: ViewUpdate): void {
+						manager.handleLiveEditorUpdate(update);
+					}
+
+					destroy(): void {
+						manager.unregisterKnownCmView(this.view);
+					}
+				},
+			),
 		];
 	}
 
@@ -579,30 +593,62 @@ export class EditorBindingManager {
 
 	/**
 	 * Get the CM6 EditorView from a MarkdownView.
-	 * This relies on Obsidian internals, so we check the current `.cm` shape
-	 * first and then fall back to a cautious heuristic search.
+	 * Resolution is based on DOM containment over a set of known CM6 views
+	 * registered by our global ViewPlugin. This avoids private Obsidian APIs.
 	 */
 	private getCmView(view: MarkdownView): EditorView | null {
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const editor = view.editor as any;
-		if (!editor) return null;
+		const container = view.containerEl;
+		if (!container) return null;
 
-		if (editor.cm?.dispatch) return editor.cm as EditorView;
-		if (editor._cm?.dispatch) return editor._cm as EditorView;
-		if (editor.editorView?.dispatch) return editor.editorView as EditorView;
-
-		for (const key of Object.keys(editor)) {
-			const prop = editor[key];
+		const leafId =
+			(view.leaf as unknown as { id?: string }).id ?? view.file?.path ?? null;
+		if (leafId) {
+			const existing = this.bindings.get(leafId);
 			if (
-				prop
-				&& typeof prop === "object"
-				&& typeof prop.dispatch === "function"
-				&& prop.state
-				&& prop.dom
+				existing
+				&& existing.cm.dom.isConnected
+				&& container.contains(existing.cm.dom)
 			) {
-				return prop as EditorView;
+				return existing.cm;
 			}
 		}
+
+		const matches: EditorView[] = [];
+		const stale: EditorView[] = [];
+		for (const cm of this.knownCmViews) {
+			if (!cm.dom.isConnected) {
+				stale.push(cm);
+				continue;
+			}
+			if (container.contains(cm.dom)) {
+				matches.push(cm);
+			}
+		}
+		for (const cm of stale) {
+			this.knownCmViews.delete(cm);
+			this.cmToLeafId.delete(cm);
+		}
+
+		if (matches.length === 0) return null;
+		if (matches.length === 1) return matches[0]!;
+
+		const activeElement =
+			typeof document !== "undefined" ? document.activeElement : null;
+		const focused = matches.filter((cm) =>
+			cm.hasFocus || (activeElement ? cm.dom.contains(activeElement) : false),
+		);
+		if (focused.length === 1) return focused[0]!;
+
+		const ids = matches.map((cm) => this.getCmId(cm));
+		this.trace?.("editor", "cm-resolution-ambiguous", {
+			leafId: leafId ?? "unknown",
+			path: view.file?.path ?? null,
+			matches: ids,
+		});
+		this.log(
+			`getCmView: ambiguous CM6 match for "${view.file?.path ?? "(unknown)"}" ` +
+			`(leaf=${leafId ?? "unknown"}, matches=${ids.join(",")})`,
+		);
 
 		return null;
 	}
@@ -611,7 +657,7 @@ export class EditorBindingManager {
 		if (this.cmDegradedWarned) return;
 		this.cmDegradedWarned = true;
 		new Notice(
-			"YAOS: Obsidian may have changed an internal editor API. " +
+			"YAOS: Could not resolve the active editor instance. " +
 			"Live collaborative editing is unavailable. Background sync may still continue, " +
 			"but live cursors and editor binding are degraded. Please check for a plugin update.",
 			10000,
@@ -627,6 +673,15 @@ export class EditorBindingManager {
 		const cmId = `cm-${++this.cmCounter}`;
 		this.cmIds.set(cm, cmId);
 		return cmId;
+	}
+
+	private registerKnownCmView(cm: EditorView): void {
+		this.knownCmViews.add(cm);
+	}
+
+	private unregisterKnownCmView(cm: EditorView): void {
+		this.knownCmViews.delete(cm);
+		this.cmToLeafId.delete(cm);
 	}
 
 	private inspectBindingHealth(
