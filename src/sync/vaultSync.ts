@@ -8,7 +8,7 @@ import type { TraceHttpContext, TraceRecord } from "../debug/trace";
 import { randomBase64Url } from "../utils/base64url";
 
 /** Current schema version. Stored in sys.schemaVersion. */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 /** Timeouts for the startup sequence. */
 const LOCAL_PERSISTENCE_TIMEOUT_MS = 3_000;
@@ -28,6 +28,20 @@ const RENAME_BATCH_MS = 50;
 
 /** Reconciliation mode determines what operations are safe. */
 export type ReconcileMode = "conservative" | "authoritative";
+
+type IndexedDbErrorKind =
+	| "quota_exceeded"
+	| "blocked"
+	| "permission"
+	| "unknown";
+
+interface IndexedDbErrorDetails {
+	kind: IndexedDbErrorKind;
+	name: string | null;
+	message: string | null;
+	phase: "open" | "wait" | "runtime";
+	at: string;
+}
 
 /**
  * Manages the vault-wide Y.Doc, the Worker sync provider, IndexedDB
@@ -64,6 +78,9 @@ export class VaultSync {
 	 * reverse lookups instead of scanning idToText.
 	 */
 	private _textToFileId = new WeakMap<Y.Text, string>();
+	private _pathIndex = new Map<string, string>(); // path -> fileId (active only)
+	private _deletedPathIndex = new Set<string>(); // tombstoned paths
+	private _pathIndexesDirty = true;
 
 	private _localReady = false;
 	private _providerSynced = false;
@@ -73,16 +90,23 @@ export class VaultSync {
 	 * first connect (gen 0) from reconnects (gen > 0).
 	 */
 	private _connectionGeneration = 0;
+	private _providerSyncWaiters = new Set<(value: boolean) => void>();
 
 	/**
 	 * True if the server sent an explicit auth error message.
 	 * When set, the plugin should stop reconnecting.
 	 */
 	private _fatalAuthError = false;
-	private _fatalAuthCode: "unauthorized" | "server_misconfigured" | "unclaimed" | null = null;
+	private _fatalAuthCode: "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required" | null = null;
+	private _fatalAuthDetails: {
+		clientSchemaVersion: number | null;
+		roomSchemaVersion: number | null;
+		reason: string | null;
+	} | null = null;
 
 	/** True if IndexedDB encountered an error (unavailable, quota, etc). */
 	private _idbError = false;
+	private _idbErrorDetails: IndexedDbErrorDetails | null = null;
 
 	/** Buffered renames for batch flush. */
 	private _renameBatch: Map<string, string> = new Map(); // oldPath -> newPath
@@ -116,6 +140,9 @@ export class VaultSync {
 		this.pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
 		this.blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
 		this.blobTombstones = this.ydoc.getMap<BlobTombstone>("blobTombstones");
+		this.meta.observe(() => {
+			this._pathIndexesDirty = true;
+		});
 
 		const roomId = settings.vaultId;
 		const idbName = `yaos:${settings.vaultId}`;
@@ -131,11 +158,28 @@ export class VaultSync {
 		// We also listen for unhandled IDB transaction errors.
 		(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
 			.catch((err: unknown) => {
-				this._idbError = true;
+				this.captureIndexedDbError(err, "open");
 				console.error("[yaos] IndexedDB failed to open:", err);
 			});
 
-		const params: Record<string, string> = { token: settings.token };
+		(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
+			.then((db: IDBDatabase) => {
+				db.addEventListener("error", (event) => {
+					const target = event.target as { error?: unknown } | null;
+					this.captureIndexedDbError(
+						target?.error ?? new Error("IndexedDB runtime error"),
+						"runtime",
+					);
+				});
+			})
+			.catch(() => {
+				// Open failure is already captured above.
+			});
+
+		const params: Record<string, string> = {
+			token: settings.token,
+			schemaVersion: String(SCHEMA_VERSION),
+		};
 		if (options?.traceContext) {
 			params.device = options.traceContext.deviceName;
 			params.trace = options.traceContext.traceId;
@@ -162,25 +206,51 @@ export class VaultSync {
 			}
 		});
 
-		// Listen for auth error messages from the server.
-		// The server sends { type: "error", code: "unauthorized" } as a
-		// text message BEFORE closing the socket, because close codes/reasons
-		// aren't always reliably delivered through transport layers.
-		this.provider.on("message", (event: MessageEvent) => {
-			if (typeof event.data !== "string") return;
+		const handleFatalAuthPayload = (payload: string) => {
 			try {
-				const msg = JSON.parse(event.data);
+				const msg = JSON.parse(payload);
 				if (
-					msg.type === "error"
-					&& (msg.code === "unauthorized" || msg.code === "server_misconfigured" || msg.code === "unclaimed")
+					msg.type !== "error"
+					|| (
+						msg.code !== "unauthorized"
+						&& msg.code !== "server_misconfigured"
+						&& msg.code !== "unclaimed"
+						&& msg.code !== "update_required"
+					)
 				) {
-					this._fatalAuthError = true;
-					this._fatalAuthCode = msg.code;
-					this.log(`Fatal auth error: ${msg.code} — stopping reconnection`);
-					this.provider.disconnect();
+					return;
 				}
+				const firstFatal = !this._fatalAuthError;
+				this._fatalAuthError = true;
+				this._fatalAuthCode = msg.code;
+				this._fatalAuthDetails = {
+					clientSchemaVersion:
+						typeof msg.clientSchemaVersion === "number" && Number.isInteger(msg.clientSchemaVersion)
+							? msg.clientSchemaVersion
+							: null,
+					roomSchemaVersion:
+						typeof msg.roomSchemaVersion === "number" && Number.isInteger(msg.roomSchemaVersion)
+							? msg.roomSchemaVersion
+							: null,
+						reason: typeof msg.reason === "string" ? msg.reason : null,
+				};
+				if (firstFatal) {
+					this.log(`Fatal auth error: ${msg.code} — stopping reconnection`);
+				}
+				this.provider.disconnect();
+				this.resolvePendingProviderSyncWaiters(false);
 			} catch {
-				// Not JSON — likely a Yjs sync message, ignore
+				// Ignore non-JSON custom messages.
+			}
+		};
+
+		// y-partyserver emits "__YPS:" control payloads via "custom-message".
+		(this.provider as unknown as { on: (event: string, cb: (payload: string) => void) => void })
+			.on("custom-message", handleFatalAuthPayload);
+		// Fallback for servers that still send plain text JSON frames.
+		this.provider.on("message", (event: MessageEvent) => {
+			if (typeof event.data === "string") {
+				handleFatalAuthPayload(event.data);
 			}
 		});
 	}
@@ -203,6 +273,7 @@ export class VaultSync {
 			this.persistence.once("synced", () => {
 				clearTimeout(timeout);
 				this._localReady = true;
+				this._pathIndexesDirty = true;
 				this.log(
 					`IndexedDB loaded (pathToId: ${this.pathToId.size}, ` +
 					`initialized: ${this.isInitialized})`,
@@ -214,7 +285,7 @@ export class VaultSync {
 			(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
 				.catch(() => {
 					clearTimeout(timeout);
-					this._idbError = true;
+					this.captureIndexedDbError(new Error("IndexedDB failed during waitForLocalPersistence"), "wait");
 					this.log("IndexedDB errored during wait — proceeding without cache");
 					resolve(false);
 				});
@@ -226,21 +297,33 @@ export class VaultSync {
 		if (this._fatalAuthError) return Promise.resolve(false);
 
 		return new Promise((resolve) => {
+			let settled = false;
+			const finish = (value: boolean) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				this.provider.off("sync", check);
+				this._providerSyncWaiters.delete(finish);
+				resolve(value);
+			};
+
 			const timeout = setTimeout(() => {
 				this.log("Provider sync timed out — entering offline mode");
-				resolve(false);
+				finish(false);
 			}, PROVIDER_SYNC_TIMEOUT_MS);
 
 			const check = (synced: boolean) => {
 				this.log(`Provider sync event: synced=${synced} (gen=${this._connectionGeneration})`);
 				if (!synced) return;
-				clearTimeout(timeout);
 				this._providerSynced = true;
-				this.provider.off("sync", check);
 				this.log("Provider synced — room state received");
-				resolve(true);
+				finish(true);
 			};
 			this.provider.on("sync", check);
+			this._providerSyncWaiters.add(finish);
+			if (this._fatalAuthError) {
+				finish(false);
+			}
 		});
 	}
 
@@ -269,7 +352,9 @@ export class VaultSync {
 	markInitialized(): void {
 		const alreadyInitialized = this.isInitialized;
 		this.sys.set("initialized", true);
-		this.sys.set("schemaVersion", SCHEMA_VERSION);
+		if (this.storedSchemaVersion === null) {
+			this.sys.set("schemaVersion", SCHEMA_VERSION);
+		}
 		if (!alreadyInitialized) {
 			this.sys.set("lastSync", Date.now());
 			this.log("Marked Y.Doc as initialized (sentinel set)");
@@ -298,6 +383,18 @@ export class VaultSync {
 		return null; // same or older version, OK
 	}
 
+	get supportedSchemaVersion(): number {
+		return SCHEMA_VERSION;
+	}
+
+	get storedSchemaVersion(): number | null {
+		const stored = this.sys.get("schemaVersion");
+		if (typeof stored !== "number" || !Number.isInteger(stored) || stored < 0) {
+			return null;
+		}
+		return stored;
+	}
+
 	// -------------------------------------------------------------------
 	// Path normalization
 	// -------------------------------------------------------------------
@@ -305,6 +402,218 @@ export class VaultSync {
 	/** Normalize a vault-relative path for consistent CRDT keys. */
 	private normPath(path: string): string {
 		return normalizePath(path);
+	}
+
+	isFileMetaDeleted(meta: FileMeta | undefined): boolean {
+		if (!meta) return false;
+		return meta.deleted === true || (typeof meta.deletedAt === "number" && Number.isFinite(meta.deletedAt));
+	}
+
+	private currentSchemaVersion(): number {
+		return this.storedSchemaVersion ?? 1;
+	}
+
+	private usesV2PathModel(): boolean {
+		return this.currentSchemaVersion() >= 2;
+	}
+
+	private shouldWriteLegacyPathMap(): boolean {
+		return !this.usesV2PathModel();
+	}
+
+	private ensurePathIndexes(): void {
+		if (!this._pathIndexesDirty) return;
+
+		this._pathIndex.clear();
+		this._deletedPathIndex.clear();
+
+		this.meta.forEach((meta, fileId) => {
+			const path = typeof meta.path === "string" ? this.normPath(meta.path) : "";
+			if (!path) return;
+
+			if (this.isFileMetaDeleted(meta)) {
+				if (!this._pathIndex.has(path)) {
+					this._deletedPathIndex.add(path);
+				}
+				return;
+			}
+
+			const existingId = this._pathIndex.get(path);
+			if (!existingId) {
+				this._pathIndex.set(path, fileId);
+				this._deletedPathIndex.delete(path);
+				return;
+			}
+
+			const existingMeta = this.meta.get(existingId);
+			const existingMtime = typeof existingMeta?.mtime === "number" ? existingMeta.mtime : 0;
+			const candidateMtime = typeof meta.mtime === "number" ? meta.mtime : 0;
+
+			// If we see active path collisions, deterministically choose one winner.
+			if (candidateMtime > existingMtime || (candidateMtime === existingMtime && fileId > existingId)) {
+				this._pathIndex.set(path, fileId);
+			}
+			this._deletedPathIndex.delete(path);
+		});
+
+		this._pathIndexesDirty = false;
+	}
+
+	private setMetaActive(fileId: string, path: string, device?: string): void {
+		const normalizedPath = this.normPath(path);
+		this.meta.set(fileId, {
+			path: normalizedPath,
+			deleted: undefined,
+			deletedAt: undefined,
+			mtime: Date.now(),
+			device,
+		});
+	}
+
+	private setMetaDeleted(fileId: string, path: string, device?: string): void {
+		const normalizedPath = this.normPath(path);
+		const deletedAt = Date.now();
+		const useLegacyFlag = this.currentSchemaVersion() < 2;
+		if (useLegacyFlag) {
+			this.meta.set(fileId, {
+				path: normalizedPath,
+				deleted: true,
+				deletedAt,
+				mtime: deletedAt,
+				device,
+			});
+			return;
+		}
+
+		// v2 tombstone payload is intentionally minimal for long-term size control.
+		this.meta.set(fileId, {
+			path: normalizedPath,
+			deletedAt,
+		});
+	}
+
+	migrateSchemaToV2(device?: string): {
+		from: number | null;
+		to: number;
+		metaUpdated: number;
+		metaCreated: number;
+		tombstonesConverted: number;
+		loserPaths: string[];
+	} {
+		const from = this.storedSchemaVersion;
+		let metaUpdated = 0;
+		let metaCreated = 0;
+		let tombstonesConverted = 0;
+		const loserPaths: string[] = [];
+
+		this.ydoc.transact(() => {
+			const now = Date.now();
+			const canonicalPathById = new Map<string, string>();
+			const pathsById = new Map<string, string[]>();
+
+			this.pathToId.forEach((fileId, rawPath) => {
+				const path = this.normPath(rawPath);
+				const list = pathsById.get(fileId);
+				if (list) {
+					list.push(path);
+				} else {
+					pathsById.set(fileId, [path]);
+				}
+			});
+
+			for (const [fileId, paths] of pathsById) {
+				const meta = this.meta.get(fileId);
+				const preferred = typeof meta?.path === "string" ? this.normPath(meta.path) : "";
+				const canonical = preferred && paths.includes(preferred)
+					? preferred
+					: paths.slice().sort()[0]!;
+				canonicalPathById.set(fileId, canonical);
+				for (const path of paths) {
+					if (path !== canonical) {
+						loserPaths.push(path);
+					}
+				}
+			}
+
+			for (const [fileId, normalizedPath] of canonicalPathById) {
+				const currentMeta = this.meta.get(fileId);
+				if (!currentMeta) {
+					this.meta.set(fileId, {
+						path: normalizedPath,
+						deletedAt: undefined,
+						deleted: undefined,
+						mtime: now,
+						device,
+					});
+					metaCreated++;
+					return;
+				}
+
+				const isDeleted = this.isFileMetaDeleted(currentMeta);
+				if (!isDeleted && currentMeta.path !== normalizedPath) {
+					this.meta.set(fileId, {
+						...currentMeta,
+						path: normalizedPath,
+						deleted: undefined,
+						deletedAt: undefined,
+						mtime: currentMeta.mtime ?? now,
+						device: currentMeta.device ?? device,
+					});
+					metaUpdated++;
+				}
+			}
+
+			this.meta.forEach((meta, fileId) => {
+				if (meta.deleted && meta.deletedAt === undefined) {
+					this.meta.set(fileId, {
+						path: this.normPath(meta.path),
+						deletedAt: typeof meta.mtime === "number" ? meta.mtime : now,
+					});
+					tombstonesConverted++;
+					return;
+				}
+				if (this.isFileMetaDeleted(meta) && (meta.deleted !== undefined || meta.mtime !== undefined || meta.device !== undefined)) {
+					this.meta.set(fileId, {
+						path: this.normPath(meta.path),
+						deletedAt: typeof meta.deletedAt === "number" ? meta.deletedAt : now,
+					});
+					metaUpdated++;
+				}
+			});
+
+			// Explicit tombstones for dropped alias paths.
+			const existingActivePaths = new Set<string>();
+			this.meta.forEach((meta) => {
+				if (this.isFileMetaDeleted(meta)) return;
+				existingActivePaths.add(this.normPath(meta.path));
+			});
+			for (const loserPath of loserPaths) {
+				if (existingActivePaths.has(loserPath)) continue;
+				const tombstoneId = this.generateFileId();
+				this.meta.set(tombstoneId, {
+					path: loserPath,
+					deletedAt: now,
+				});
+			}
+
+			this.sys.set("schemaVersion", 2);
+			this.sys.set("migratedAt", now);
+			this.sys.set("migratedBy", device ?? this._device ?? "unknown");
+		}, ORIGIN_SEED);
+
+		this._pathIndexesDirty = true;
+		this.log(
+			`schema migration: ${from ?? "none"} -> 2 ` +
+			`(metaUpdated=${metaUpdated}, metaCreated=${metaCreated}, tombstonesConverted=${tombstonesConverted})`,
+		);
+		return {
+			from,
+			to: 2,
+			metaUpdated,
+			metaCreated,
+			tombstonesConverted,
+			loserPaths,
+		};
 	}
 
 	// -------------------------------------------------------------------
@@ -324,65 +633,67 @@ export class VaultSync {
 		let duplicateIds = 0;
 		let orphansCleaned = 0;
 
-		// 1. Check for duplicate fileIds (two paths → one id)
-		const idToPaths = new Map<string, string[]>();
-		this.pathToId.forEach((fileId, path) => {
-			const paths = idToPaths.get(fileId);
-			if (paths) {
-				paths.push(path);
-			} else {
-				idToPaths.set(fileId, [path]);
-			}
-		});
+		// 1. Legacy duplicate-id repair for schema v1 only.
+		// In schema v2, id->meta.path is authoritative and this clone behavior
+		// is intentionally disabled.
+		if (!this.usesV2PathModel()) {
+			const idToPaths = new Map<string, string[]>();
+			this.pathToId.forEach((fileId, path) => {
+				const paths = idToPaths.get(fileId);
+				if (paths) {
+					paths.push(path);
+				} else {
+					idToPaths.set(fileId, [path]);
+				}
+			});
 
-		for (const [fileId, paths] of idToPaths) {
-			if (paths.length <= 1) continue;
+			for (const [fileId, paths] of idToPaths) {
+				if (paths.length <= 1) continue;
 
-			duplicateIds++;
-			this.log(
-				`integrity: fileId ${fileId} shared by ${paths.length} paths: ${paths.join(", ")}`,
-			);
-
-			// Keep the first path, give the others new IDs.
-			// We can't easily re-seed content here (no disk access), so we
-			// clone the Y.Text for the duplicate paths.
-			const keepPath = paths[0]!;
-			const sourceText = this.idToText.get(fileId);
-
-			for (let i = 1; i < paths.length; i++) {
-				const dupPath = paths[i]!;
-				const newId = this.generateFileId();
-				const newText = new Y.Text();
-
-				this.ydoc.transact(() => {
-					if (sourceText) {
-						newText.insert(0, sourceText.toString());
-					}
-					this.pathToId.set(dupPath, newId);
-					this.idToText.set(newId, newText);
-					this.meta.set(newId, {
-						path: dupPath,
-						mtime: Date.now(),
-						device: this._device,
-					});
-				}, ORIGIN_SEED);
-
+				duplicateIds++;
 				this.log(
-					`integrity: gave "${dupPath}" new id=${newId} (was sharing ${fileId} with "${keepPath}")`,
+					`integrity: fileId ${fileId} shared by ${paths.length} paths: ${paths.join(", ")}`,
 				);
+
+				const keepPath = paths[0]!;
+				const sourceText = this.idToText.get(fileId);
+
+				for (let i = 1; i < paths.length; i++) {
+					const dupPath = paths[i]!;
+					const newId = this.generateFileId();
+					const newText = new Y.Text();
+
+					this.ydoc.transact(() => {
+						if (sourceText) {
+							newText.insert(0, sourceText.toString());
+						}
+						this.pathToId.set(dupPath, newId);
+						this.idToText.set(newId, newText);
+						this.meta.set(newId, {
+							path: dupPath,
+							mtime: Date.now(),
+							device: this._device,
+						});
+					}, ORIGIN_SEED);
+
+					this.log(
+						`integrity: gave "${dupPath}" new id=${newId} (was sharing ${fileId} with "${keepPath}")`,
+					);
+				}
 			}
 		}
 
 		// 2. Orphan GC: find idToText/meta entries with no pathToId reference
 		const referencedIds = new Set<string>();
-		this.pathToId.forEach((fileId) => {
+		this.ensurePathIndexes();
+		for (const fileId of this._pathIndex.values()) {
 			referencedIds.add(fileId);
-		});
+		}
 
 		// Also keep tombstoned IDs (they're intentionally orphaned from pathToId)
 		const tombstonedIds = new Set<string>();
 		this.meta.forEach((meta, fileId) => {
-			if (meta.deleted) {
+			if (this.isFileMetaDeleted(meta)) {
 				tombstonedIds.add(fileId);
 			}
 		});
@@ -459,20 +770,8 @@ export class VaultSync {
 		const untracked: string[] = [];
 		let skipped = 0;
 
-		const crdtPaths = new Set<string>();
-		const tombstonedIds = new Set<string>();
-
-		this.meta.forEach((meta, fileId) => {
-			if (meta.deleted) {
-				tombstonedIds.add(fileId);
-			}
-		});
-
-		this.pathToId.forEach((fileId, path) => {
-			if (!tombstonedIds.has(fileId)) {
-				crdtPaths.add(path);
-			}
-		});
+		this.ensurePathIndexes();
+		const crdtPaths = new Set<string>(this._pathIndex.keys());
 
 		// CRDT files not on disk → create on disk
 		// IMPORTANT: use diskPresentPaths (all known disk paths), not
@@ -502,14 +801,7 @@ export class VaultSync {
 		for (const path of diskPresentPaths) {
 			if (crdtPaths.has(path)) continue;
 
-			let wasTombstoned = false;
-			this.meta.forEach((meta) => {
-				if (meta.path === path && meta.deleted) {
-					wasTombstoned = true;
-				}
-			});
-
-			if (wasTombstoned) {
+			if (this._deletedPathIndex.has(path)) {
 				this.log(`reconcile: "${path}" was tombstoned, skipping`);
 				skipped++;
 				continue;
@@ -557,11 +849,11 @@ export class VaultSync {
 	ensureFile(path: string, currentContent: string, device?: string): Y.Text | null {
 		path = this.normPath(path);
 
-		const existingId = this.pathToId.get(path);
+		const existingId = this.getFileId(path);
 		if (!existingId) {
 			this.promotePendingRenameTarget(path, device);
 		}
-		const resolvedId = this.pathToId.get(path);
+		const resolvedId = this.getFileId(path);
 		if (resolvedId) {
 			const existingText = this.idToText.get(resolvedId);
 			if (existingText) {
@@ -578,7 +870,9 @@ export class VaultSync {
 				`ensureFile: "${path}" has id=${resolvedId} but no Y.Text — cleaning up orphan`,
 			);
 			this.ydoc.transact(() => {
-				this.pathToId.delete(path);
+				if (this.shouldWriteLegacyPathMap()) {
+					this.pathToId.delete(path);
+				}
 				this.idToText.delete(resolvedId);
 				this.meta.delete(resolvedId);
 			}, ORIGIN_SEED);
@@ -602,27 +896,26 @@ export class VaultSync {
 
 		this.ydoc.transact(() => {
 			ytext.insert(0, currentContent);
-			this.pathToId.set(path, fileId);
+			if (this.shouldWriteLegacyPathMap()) {
+				this.pathToId.set(path, fileId);
+			}
 			this.idToText.set(fileId, ytext);
-			this.meta.set(fileId, {
-				path,
-				mtime: Date.now(),
-				device,
-			});
+			this.setMetaActive(fileId, path, device);
 		}, ORIGIN_SEED);
 
+		this._pathIndexesDirty = true;
 		this.log(`ensureFile: created "${path}" (id=${fileId})`);
 		this._textToFileId.set(ytext, fileId);
 		return ytext;
 	}
 
 	isMarkdownTombstoned(path: string): boolean {
-		return this.getMarkdownTombstoneIds(path).length > 0;
+		return this.isPathTombstoned(path) || this.getMarkdownTombstoneIds(path).length > 0;
 	}
 
 	getTextForPath(path: string): Y.Text | null {
 		path = this.normPath(path);
-		const fileId = this.pathToId.get(path);
+		const fileId = this.getFileId(path);
 		if (!fileId) return null;
 		const text = this.idToText.get(fileId) ?? null;
 		if (text) this._textToFileId.set(text, fileId);
@@ -630,7 +923,15 @@ export class VaultSync {
 	}
 
 	getFileId(path: string): string | undefined {
-		return this.pathToId.get(this.normPath(path));
+		path = this.normPath(path);
+		if (this.usesV2PathModel()) {
+			this.ensurePathIndexes();
+			return this._pathIndex.get(path);
+		}
+		const legacy = this.pathToId.get(path);
+		if (legacy) return legacy;
+		this.ensurePathIndexes();
+		return this._pathIndex.get(path);
 	}
 
 	/**
@@ -640,6 +941,16 @@ export class VaultSync {
 	 */
 	getFileIdForText(ytext: Y.Text): string | undefined {
 		return this._textToFileId.get(ytext);
+	}
+
+	getActiveMarkdownPaths(): string[] {
+		this.ensurePathIndexes();
+		return Array.from(this._pathIndex.keys());
+	}
+
+	isPathTombstoned(path: string): boolean {
+		this.ensurePathIndexes();
+		return this._deletedPathIndex.has(this.normPath(path));
 	}
 
 	// -------------------------------------------------------------------
@@ -808,23 +1119,22 @@ export class VaultSync {
 		oldPath = this.normPath(oldPath);
 		newPath = this.normPath(newPath);
 
-		const fileId = this.pathToId.get(oldPath);
+		const fileId = this.getFileId(oldPath);
 		if (!fileId) {
 			this.log(`handleRename: "${oldPath}" not in CRDT, ignoring`);
 			return;
 		}
 
 		this.ydoc.transact(() => {
-			this.pathToId.delete(oldPath);
-			this.pathToId.set(newPath, fileId);
+			if (this.shouldWriteLegacyPathMap()) {
+				this.pathToId.delete(oldPath);
+				this.pathToId.set(newPath, fileId);
+			}
 			this.clearMarkdownTombstonesForPath(newPath, fileId);
-			this.meta.set(fileId, {
-				path: newPath,
-				mtime: Date.now(),
-				device,
-			});
+			this.setMetaActive(fileId, newPath, device);
 		}, ORIGIN_SEED);
 
+		this._pathIndexesDirty = true;
 		this.log(`handleRename: "${oldPath}" -> "${newPath}" (id=${fileId})`);
 	}
 
@@ -849,16 +1159,14 @@ export class VaultSync {
 
 		this.ydoc.transact(() => {
 			for (const [oldPath, newPath] of batch) {
-				const fileId = this.pathToId.get(oldPath);
+				const fileId = this.getFileId(oldPath);
 				if (fileId) {
-					this.pathToId.delete(oldPath);
-					this.pathToId.set(newPath, fileId);
+					if (this.shouldWriteLegacyPathMap()) {
+						this.pathToId.delete(oldPath);
+						this.pathToId.set(newPath, fileId);
+					}
 					this.clearMarkdownTombstonesForPath(newPath, fileId);
-					this.meta.set(fileId, {
-						path: newPath,
-						mtime: Date.now(),
-						device,
-					});
+					this.setMetaActive(fileId, newPath, device);
 					this.log(`renameBatch: "${oldPath}" -> "${newPath}" (id=${fileId})`);
 				}
 
@@ -874,6 +1182,7 @@ export class VaultSync {
 			}
 		}, ORIGIN_SEED);
 
+		this._pathIndexesDirty = true;
 		this._onRenameBatchFlushed?.(batch);
 	}
 
@@ -883,7 +1192,7 @@ export class VaultSync {
 			if (
 				fileId !== keepFileId
 				&& meta.path === path
-				&& meta.deleted
+				&& this.isFileMetaDeleted(meta)
 			) {
 				tombstonedIds.push(fileId);
 			}
@@ -900,7 +1209,7 @@ export class VaultSync {
 		const normalizedPath = this.normPath(path);
 		const tombstonedIds: string[] = [];
 		this.meta.forEach((meta, fileId) => {
-			if (meta.path === normalizedPath && meta.deleted) {
+			if (meta.path === normalizedPath && this.isFileMetaDeleted(meta)) {
 				tombstonedIds.push(fileId);
 			}
 		});
@@ -942,7 +1251,7 @@ export class VaultSync {
 			resolvedPath = path;
 		}
 
-		const fileId = this.pathToId.get(resolvedPath);
+		const fileId = this.getFileId(resolvedPath);
 		if (!fileId) {
 			// Not a markdown file — might be a blob
 			if (this.pathToBlob.has(resolvedPath)) {
@@ -954,15 +1263,13 @@ export class VaultSync {
 		}
 
 		this.ydoc.transact(() => {
-			this.pathToId.delete(resolvedPath);
-			this.meta.set(fileId, {
-				path: resolvedPath,
-				deleted: true,
-				mtime: Date.now(),
-				device,
-			});
+			if (this.shouldWriteLegacyPathMap()) {
+				this.pathToId.delete(resolvedPath);
+			}
+			this.setMetaDeleted(fileId, resolvedPath, device);
 		}, ORIGIN_SEED);
 
+		this._pathIndexesDirty = true;
 		this.trace?.("sync", "markdown-tombstoned", {
 			requestedPath: path,
 			resolvedPath,
@@ -997,12 +1304,31 @@ export class VaultSync {
 		return this._fatalAuthError;
 	}
 
-	get fatalAuthCode(): "unauthorized" | "server_misconfigured" | "unclaimed" | null {
+	get fatalAuthCode(): "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required" | null {
 		return this._fatalAuthCode;
+	}
+
+	get fatalAuthDetails(): {
+		clientSchemaVersion: number | null;
+		roomSchemaVersion: number | null;
+		reason: string | null;
+	} | null {
+		return this._fatalAuthDetails;
 	}
 
 	get idbError(): boolean {
 		return this._idbError;
+	}
+
+	get idbErrorDetails(): IndexedDbErrorDetails | null {
+		return this._idbErrorDetails;
+	}
+
+	reportIndexedDbError(
+		err: unknown,
+		phase: IndexedDbErrorDetails["phase"] = "runtime",
+	): void {
+		this.captureIndexedDbError(err, phase);
 	}
 
 	/** The IndexedDB database name for this vault. */
@@ -1033,6 +1359,7 @@ export class VaultSync {
 			for (const k of blobMetaKeys) this.blobMeta.delete(k);
 			for (const k of blobTombKeys) this.blobTombstones.delete(k);
 		}, ORIGIN_SEED);
+		this._pathIndexesDirty = true;
 
 		this.log(
 			`clearAllMaps: removed ${pathKeys.length} paths, ` +
@@ -1119,9 +1446,14 @@ export class VaultSync {
 		connectionGeneration: number;
 		fatalAuthError: boolean;
 		idbError: boolean;
+		idbErrorDetails: IndexedDbErrorDetails | null;
 		pathToIdCount: number;
+		activePathCount: number;
+		tombstonedPathCount: number;
+		storedSchemaVersion: number | null;
 		blobPathCount: number;
 	} {
+		this.ensurePathIndexes();
 		return {
 			connected: this.connected,
 			providerSynced: this.providerSynced,
@@ -1129,9 +1461,78 @@ export class VaultSync {
 			connectionGeneration: this.connectionGeneration,
 			fatalAuthError: this.fatalAuthError,
 			idbError: this.idbError,
+			idbErrorDetails: this.idbErrorDetails,
 			pathToIdCount: this.pathToId.size,
+			activePathCount: this._pathIndex.size,
+			tombstonedPathCount: this._deletedPathIndex.size,
+			storedSchemaVersion: this.storedSchemaVersion,
 			blobPathCount: this.pathToBlob.size,
 		};
+	}
+
+	private resolvePendingProviderSyncWaiters(value: boolean): void {
+		if (this._providerSyncWaiters.size === 0) return;
+		const waiters = Array.from(this._providerSyncWaiters);
+		this._providerSyncWaiters.clear();
+		for (const waiter of waiters) {
+			try {
+				waiter(value);
+			} catch {
+				// Ignore waiter errors; each promise handles its own lifecycle.
+			}
+		}
+	}
+
+	private classifyIndexedDbError(err: unknown): {
+		kind: IndexedDbErrorKind;
+		name: string | null;
+		message: string | null;
+	} {
+		const name =
+			typeof (err as { name?: unknown })?.name === "string"
+				? (err as { name: string }).name
+				: null;
+		const message =
+			typeof (err as { message?: unknown })?.message === "string"
+				? (err as { message: string }).message
+				: err
+					? String(err)
+					: null;
+
+		const haystack = `${name ?? ""} ${message ?? ""}`.toLowerCase();
+		if (haystack.includes("quotaexceeded") || haystack.includes("quota exceeded")) {
+			return { kind: "quota_exceeded", name, message };
+		}
+		if (haystack.includes("blocked")) {
+			return { kind: "blocked", name, message };
+		}
+		if (haystack.includes("security") || haystack.includes("permission") || haystack.includes("denied")) {
+			return { kind: "permission", name, message };
+		}
+		return { kind: "unknown", name, message };
+	}
+
+	private captureIndexedDbError(err: unknown, phase: IndexedDbErrorDetails["phase"]): void {
+		const classified = this.classifyIndexedDbError(err);
+		this._idbError = true;
+		if (
+			!this._idbErrorDetails
+			|| (
+				this._idbErrorDetails.kind !== "quota_exceeded"
+				&& classified.kind === "quota_exceeded"
+			)
+		) {
+			this._idbErrorDetails = {
+				...classified,
+				phase,
+				at: new Date().toISOString(),
+			};
+		}
+		this.log(
+			`IndexedDB error (${phase}): kind=${classified.kind}` +
+			`${classified.name ? ` name=${classified.name}` : ""}` +
+			`${classified.message ? ` msg=${classified.message}` : ""}`,
+		);
 	}
 
 	private log(msg: string): void {

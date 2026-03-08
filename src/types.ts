@@ -12,7 +12,9 @@ import { isExcluded } from "./sync/exclude";
 export interface FileMeta {
 	/** Vault-relative path (normalized). */
 	path: string;
-	/** Soft-delete flag. When true, file should be removed from disk. */
+	/** v2 tombstone timestamp (ms since epoch). */
+	deletedAt?: number;
+	/** Legacy v1 soft-delete flag (kept for migration compatibility). */
 	deleted?: boolean;
 	/** Last-modified timestamp (ms since epoch). Informational only. */
 	mtime?: number;
