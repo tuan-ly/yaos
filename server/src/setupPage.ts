@@ -126,9 +126,14 @@ export function renderSetupPage(options: SetupPageOptions): string {
     button[disabled] { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
 
     .ghost-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       background: rgba(255,255,255,0.05);
       color: #f4f7fb;
       border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      font-weight: 600;
     }
     .ghost-btn:hover { background: rgba(255,255,255,0.1); }
 
@@ -201,18 +206,13 @@ export function renderSetupPage(options: SetupPageOptions): string {
       text-decoration: none;
       box-sizing: border-box;
     }
-    .step-recovery .primary-action {
+    .step-recovery .ghost-btn.ghost-btn--light {
       background: #f4f7fb;
       color: #08111d;
       border-color: transparent;
-      padding-inline: 16px;
-      box-shadow: 0 6px 16px rgba(244, 247, 251, 0.16);
-      transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
     }
-    .step-recovery .primary-action:hover {
+    .step-recovery .ghost-btn.ghost-btn--light:hover {
       background: #ffffff;
-      transform: translateY(-1px);
-      box-shadow: 0 10px 22px rgba(244, 247, 251, 0.2);
     }
 
     /* Step 2 states */
@@ -327,7 +327,7 @@ export function renderSetupPage(options: SetupPageOptions): string {
         </div>
         ${installationStep}
         <div class="step-recovery">
-          <a class="ghost-btn primary-action" href="obsidian://show-plugin?id=obsidian42-brat">Open BRAT</a>
+          <a class="ghost-btn ghost-btn--light" href="obsidian://show-plugin?id=obsidian42-brat">Open BRAT</a>
           <button id="copy-repo-desktop" class="ghost-btn" type="button">Copy repo slug</button>
         </div>
         <label class="checkbox-wrapper">
@@ -355,24 +355,31 @@ export function renderSetupPage(options: SetupPageOptions): string {
 
         <details>
           <summary>Advanced: Manual Setup Token</summary>
-          <div class="manual-content">
-            <div>
-              <label for="host-input" class="manual-label">Server link</label>
-              <div class="manual-row">
-                <input id="host-input" type="text" readonly />
-                <button id="copy-host" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
-              </div>
-            </div>
-            <div>
-              <label for="token-input" class="manual-label">Token</label>
-              <div class="manual-row">
-                <input id="token-input" type="text" readonly />
-                <button id="copy-token" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
-              </div>
-            </div>
-          </div>
-        </details>
-      </div>
+	          <div class="manual-content">
+	            <div>
+	              <label for="host-input" class="manual-label">Server link</label>
+	              <div class="manual-row">
+	                <input id="host-input" type="text" readonly />
+	                <button id="copy-host" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
+	              </div>
+	            </div>
+	            <div>
+	              <label for="token-input" class="manual-label">Token</label>
+	              <div class="manual-row">
+	                <input id="token-input" type="text" readonly />
+	                <button id="copy-token" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
+	              </div>
+	            </div>
+	            <div>
+	              <label for="vault-input" class="manual-label">Vault ID</label>
+	              <div class="manual-row">
+	                <input id="vault-input" type="text" readonly />
+	                <button id="copy-vault" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
+	              </div>
+	            </div>
+	          </div>
+	        </details>
+	      </div>
     </div>
 
   </main>
@@ -389,23 +396,33 @@ export function renderSetupPage(options: SetupPageOptions): string {
     const openBtn = document.getElementById("open");
     const qrEl = document.getElementById("qr");
 
-    const hostInput = document.getElementById("host-input");
-    const tokenInput = document.getElementById("token-input");
-    const copyHostBtn = document.getElementById("copy-host");
-    const copyTokenBtn = document.getElementById("copy-token");
-    const copyRepoDesktopBtn = document.getElementById("copy-repo-desktop");
-    const repoSlug = "kavinsood/yaos";
+	    const hostInput = document.getElementById("host-input");
+	    const tokenInput = document.getElementById("token-input");
+	    const vaultInput = document.getElementById("vault-input");
+	    const copyHostBtn = document.getElementById("copy-host");
+	    const copyTokenBtn = document.getElementById("copy-token");
+	    const copyVaultBtn = document.getElementById("copy-vault");
+	    const copyRepoDesktopBtn = document.getElementById("copy-repo-desktop");
+	    const repoSlug = "kavinsood/yaos";
 
-    function randomToken() {
-      const bytes = new Uint8Array(32);
-      crypto.getRandomValues(bytes);
-      return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
-    }
+	    function randomToken() {
+	      const bytes = new Uint8Array(32);
+	      crypto.getRandomValues(bytes);
+	      return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+	    }
 
-    function buildMobileSetupUrl(host, token) {
-      const hash = new URLSearchParams({ host: host, token: token }).toString();
-      return host + "/mobile-setup#" + hash;
-    }
+	    function randomVaultId() {
+	      const bytes = new Uint8Array(16);
+	      crypto.getRandomValues(bytes);
+	      let binary = "";
+	      for (const b of bytes) binary += String.fromCharCode(b);
+	      return btoa(binary).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, "");
+	    }
+
+	    function buildMobileSetupUrl(host, token, vaultId) {
+	      const hash = new URLSearchParams({ host: host, token: token, vaultId: vaultId }).toString();
+	      return host + "/mobile-setup#" + hash;
+	    }
 
     function renderQr(text) {
       if (!text || !window.QRious) return;
@@ -449,12 +466,19 @@ export function renderSetupPage(options: SetupPageOptions): string {
     });
 
     // Copy token logic
-    copyTokenBtn.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(tokenInput.value);
-      const originalText = copyTokenBtn.textContent;
-      copyTokenBtn.textContent = "Copied!";
-      setTimeout(() => copyTokenBtn.textContent = originalText, 2000);
-    });
+	    copyTokenBtn.addEventListener("click", async () => {
+	      await navigator.clipboard.writeText(tokenInput.value);
+	      const originalText = copyTokenBtn.textContent;
+	      copyTokenBtn.textContent = "Copied!";
+	      setTimeout(() => copyTokenBtn.textContent = originalText, 2000);
+	    });
+
+	    copyVaultBtn.addEventListener("click", async () => {
+	      await navigator.clipboard.writeText(vaultInput.value);
+	      const originalText = copyVaultBtn.textContent;
+	      copyVaultBtn.textContent = "Copied!";
+	      setTimeout(() => copyVaultBtn.textContent = originalText, 2000);
+	    });
 
     copyRepoDesktopBtn.addEventListener("click", async () => {
       await navigator.clipboard.writeText(repoSlug);
@@ -463,33 +487,35 @@ export function renderSetupPage(options: SetupPageOptions): string {
       setTimeout(() => copyRepoDesktopBtn.textContent = originalText, 2000);
     });
 
-    claimButton.addEventListener("click", async () => {
-      claimButton.disabled = true;
-      statusEl.textContent = "Claiming server...";
-      const token = randomToken();
+	    claimButton.addEventListener("click", async () => {
+	      claimButton.disabled = true;
+	      statusEl.textContent = "Claiming server...";
+	      const token = randomToken();
+	      const vaultId = randomVaultId();
 
-      try {
-        const res = await fetch("/claim", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token }),
-        });
+	      try {
+	        const res = await fetch("/claim", {
+	          method: "POST",
+	          headers: { "Content-Type": "application/json" },
+	          body: JSON.stringify({ token, vaultId }),
+	        });
 
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
           throw new Error(data.error || "Claim failed");
         }
 
-        // Setup the UI state
-        hostInput.value = window.location.origin;
-        tokenInput.value = token;
+	        // Setup the UI state
+	        hostInput.value = window.location.origin;
+	        tokenInput.value = token;
+	        vaultInput.value = vaultId;
 
-        // Deep link for local button
-        const deepLink = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host: window.location.origin, token: token }).toString();
-        openBtn.href = deepLink;
+	        // Deep link for local button
+	        const deepLink = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host: window.location.origin, token: token, vaultId: vaultId }).toString();
+	        openBtn.href = deepLink;
 
-        // QR Code pointing to the trampoline page
-        renderQr(buildMobileSetupUrl(window.location.origin, token));
+	        // QR Code pointing to the trampoline page
+	        renderQr(buildMobileSetupUrl(window.location.origin, token, vaultId));
 
         // Switch Views
         initialView.style.display = "none";
@@ -604,47 +630,52 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
       </div>
     </div>
 
-    <details>
-      <summary>Manual Fallback</summary>
-      <div class="manual-box">
-        <label>Host</label>
-        <input id="host-input" readonly />
-        <label>Token</label>
-        <input id="token-input" readonly />
-        <p style="font-size: 11px; margin: 0; color: #6984a3;">Copy these to YAOS settings if the button fails.</p>
-      </div>
-    </details>
+	    <details>
+	      <summary>Manual Fallback</summary>
+	      <div class="manual-box">
+	        <label>Host</label>
+	        <input id="host-input" readonly />
+	        <label>Token</label>
+	        <input id="token-input" readonly />
+	        <label>Vault ID</label>
+	        <input id="vault-input" readonly />
+	        <p style="font-size: 11px; margin: 0; color: #6984a3;">Copy these to YAOS settings if the button fails.</p>
+	      </div>
+	    </details>
   </main>
 
   <script>
     const connectBtn = document.getElementById("connect-button");
-    const statusEl = document.getElementById("status");
-    const hostInput = document.getElementById("host-input");
-    const tokenInput = document.getElementById("token-input");
-    const copyRepoBtn = document.getElementById("copy-repo");
-    const repoSlug = "kavinsood/yaos";
+	    const statusEl = document.getElementById("status");
+	    const hostInput = document.getElementById("host-input");
+	    const tokenInput = document.getElementById("token-input");
+	    const vaultInput = document.getElementById("vault-input");
+	    const copyRepoBtn = document.getElementById("copy-repo");
+	    const repoSlug = "kavinsood/yaos";
 
     function parseHash() {
       const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
       const params = new URLSearchParams(hash);
-      return {
-        host: (params.get("host") || "").trim().replace(/\\/$/, ""),
-        token: (params.get("token") || "").trim()
-      };
-    }
+	      return {
+	        host: (params.get("host") || "").trim().replace(/\\/$/, ""),
+	        token: (params.get("token") || "").trim(),
+	        vaultId: (params.get("vaultId") || "").trim(),
+	      };
+	    }
 
-    const { host, token } = parseHash();
+	    const { host, token, vaultId } = parseHash();
 
-    if (!host || !token) {
-      statusEl.textContent = "Error: Invalid setup link. Please re-scan the QR code.";
-      statusEl.style.color = "#ff6b6b";
-    } else {
-      hostInput.value = host;
-      tokenInput.value = token;
+	    if (!host || !token || !vaultId) {
+	      statusEl.textContent = "Error: Invalid setup link. Please re-scan the QR code.";
+	      statusEl.style.color = "#ff6b6b";
+	    } else {
+	      hostInput.value = host;
+	      tokenInput.value = token;
+	      vaultInput.value = vaultId;
 
-      const deepLink = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host, token }).toString();
-      connectBtn.href = deepLink;
-      connectBtn.removeAttribute("aria-disabled");
+	      const deepLink = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host, token, vaultId }).toString();
+	      connectBtn.href = deepLink;
+	      connectBtn.removeAttribute("aria-disabled");
 
       // Scrub the URL history to hide the token fragment immediately
       window.history.replaceState(null, "", window.location.pathname);

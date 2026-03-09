@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type VaultCrdtSyncPlugin from "./main";
 import { randomBase64Url } from "./utils/base64url";
 
@@ -58,7 +58,8 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	externalEditPolicy: "always",
 	enableAttachmentSync: false,
 	maxAttachmentSizeKB: 10240,
-	attachmentConcurrency: 2,
+	// requestUrl cannot be hard-aborted; default to 1 to avoid stacked zombie transfers.
+	attachmentConcurrency: 1,
 	showRemoteCursors: true,
 };
 
@@ -80,6 +81,102 @@ function isInsecureRemoteHost(host: string): boolean {
 		return true;
 	} catch {
 		return false;
+	}
+}
+
+class PairDeviceModal extends Modal {
+	constructor(
+		app: App,
+		private readonly deepLink: string,
+		private readonly mobileUrl: string,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+
+		contentEl.createEl("h3", { text: "Pair new device" });
+		contentEl.createEl("p", {
+			text: "Use the mobile setup URL on your phone, or copy the deep link directly on desktop.",
+		});
+
+		contentEl.createEl("h4", { text: "Mobile setup URL" });
+		const mobileInput = contentEl.createEl("textarea");
+		mobileInput.value = this.mobileUrl;
+		mobileInput.readOnly = true;
+		mobileInput.rows = 3;
+		mobileInput.style.width = "100%";
+		mobileInput.style.marginBottom = "8px";
+
+		const mobileButtons = contentEl.createDiv({ cls: "modal-button-container" });
+		mobileButtons.createEl("button", { text: "Copy mobile URL" }).addEventListener("click", () => {
+			void navigator.clipboard.writeText(this.mobileUrl).then(
+				() => new Notice("YAOS: mobile setup URL copied."),
+				() => new Notice("YAOS: failed to copy mobile setup URL.", 6000),
+			);
+		});
+		mobileButtons.createEl("button", { text: "Open mobile setup page" }).addEventListener("click", () => {
+			window.open(this.mobileUrl, "_blank", "noopener");
+		});
+
+		contentEl.createEl("h4", { text: "Deep link" });
+		const deepInput = contentEl.createEl("textarea");
+		deepInput.value = this.deepLink;
+		deepInput.readOnly = true;
+		deepInput.rows = 3;
+		deepInput.style.width = "100%";
+		deepInput.style.marginBottom = "8px";
+
+		const deepButtons = contentEl.createDiv({ cls: "modal-button-container" });
+		deepButtons.createEl("button", { text: "Copy deep link" }).addEventListener("click", () => {
+			void navigator.clipboard.writeText(this.deepLink).then(
+				() => new Notice("YAOS: deep link copied."),
+				() => new Notice("YAOS: failed to copy deep link.", 6000),
+			);
+		});
+		deepButtons.createEl("button", { text: "Close" }).addEventListener("click", () => this.close());
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+class RecoveryKitModal extends Modal {
+	constructor(app: App, private readonly recoveryKit: string) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+
+		contentEl.createEl("h3", { text: "Recovery kit" });
+		contentEl.createEl("p", {
+			text: "Save this in your password manager. You need host, token, and vault ID to recover this room on a new device.",
+		});
+
+		const textArea = contentEl.createEl("textarea");
+		textArea.value = this.recoveryKit;
+		textArea.readOnly = true;
+		textArea.rows = 10;
+		textArea.style.width = "100%";
+		textArea.style.marginBottom = "8px";
+
+		const buttons = contentEl.createDiv({ cls: "modal-button-container" });
+		buttons.createEl("button", { text: "Copy recovery kit" }).addEventListener("click", () => {
+			void navigator.clipboard.writeText(this.recoveryKit).then(
+				() => new Notice("YAOS: recovery kit copied."),
+				() => new Notice("YAOS: failed to copy recovery kit.", 6000),
+			);
+		});
+		buttons.createEl("button", { text: "Close" }).addEventListener("click", () => this.close());
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }
 
@@ -177,20 +274,47 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 
-		new Setting(containerEl)
-			.setName("Vault ID")
-			.setDesc(
-				"Unique identifier for this vault. All devices syncing the same vault must use the same ID. Auto-generated if left empty.",
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("auto-generated")
-					.setValue(this.plugin.settings.vaultId)
-					.onChange(async (value) => {
-						this.plugin.settings.vaultId = value.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
+			containerEl.createEl("h3", { text: "Pairing" });
+
+			new Setting(containerEl)
+				.setName("Pair new device")
+				.setDesc(
+					"Generate pairing links with host, token, and vault ID from this vault.",
+				)
+				.addButton((button) =>
+					button
+						.setButtonText("Show pairing links")
+						.setCta()
+						.setDisabled(!this.plugin.buildSetupDeepLink())
+						.onClick(() => {
+							const deepLink = this.plugin.buildSetupDeepLink();
+							const mobileUrl = this.plugin.buildMobileSetupUrl();
+							if (!deepLink || !mobileUrl) {
+								new Notice("YAOS: configure host, token, and vault ID before pairing.", 7000);
+								return;
+							}
+							new PairDeviceModal(this.app, deepLink, mobileUrl).open();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Export recovery kit")
+				.setDesc(
+					"Export host, token, and vault ID so you can recover this room on a new device.",
+				)
+				.addButton((button) =>
+					button
+						.setButtonText("Show recovery kit")
+						.setDisabled(!this.plugin.buildRecoveryKitText())
+						.onClick(() => {
+							const recoveryKit = this.plugin.buildRecoveryKitText();
+							if (!recoveryKit) {
+								new Notice("YAOS: configure host, token, and vault ID before exporting recovery kit.", 7000);
+								return;
+							}
+							new RecoveryKitModal(this.app, recoveryKit).open();
+						}),
+				);
 
 		new Setting(containerEl)
 			.setName("Device name")
@@ -315,7 +439,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			new Setting(containerEl)
 				.setName("Concurrent transfers")
 				.setDesc(
-					"Number of parallel upload/download slots (1-5). Lower values reduce mobile battery use.",
+					"Number of parallel upload/download slots (1-5). Default 1 favors reliability on slow/mobile networks.",
 				)
 				.addSlider((slider) =>
 					slider
@@ -329,10 +453,33 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				);
 		}
 
-		containerEl.createEl("h3", { text: "Advanced" });
+			containerEl.createEl("h3", { text: "Advanced" });
 
-		new Setting(containerEl)
-			.setName("Show remote cursors")
+			const vaultIdentityDetails = containerEl.createEl("details");
+			const vaultIdentitySummary = vaultIdentityDetails.createEl("summary", {
+				text: "Vault identity (advanced)",
+			});
+			vaultIdentitySummary.style.cursor = "pointer";
+			const vaultIdentityBody = vaultIdentityDetails.createDiv();
+			vaultIdentityBody.style.marginTop = "8px";
+
+			new Setting(vaultIdentityBody)
+				.setName("Vault ID")
+				.setDesc(
+					"Manual override. Devices syncing the same vault must use exactly the same Vault ID.",
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("auto-generated")
+						.setValue(this.plugin.settings.vaultId)
+						.onChange(async (value) => {
+							this.plugin.settings.vaultId = value.trim();
+							await this.plugin.saveSettings();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Show remote cursors")
 			.setDesc(
 				"Display cursors and selections from other connected devices in the editor.",
 			)

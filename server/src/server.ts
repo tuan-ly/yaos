@@ -38,6 +38,7 @@ export class VaultSyncServer extends YServer {
 	};
 
 	private documentLoaded = false;
+	private roomIdHint: string | null = null;
 	private chunkedDocStore: ChunkedDocStore | null = null;
 	private saveChain: Promise<void> = Promise.resolve();
 	private lastSavedStateVector: Uint8Array | null = null;
@@ -63,6 +64,7 @@ export class VaultSyncServer extends YServer {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		this.captureRoomIdHint(request);
 		await this.ensureDocumentLoaded();
 
 		const url = new URL(request.url);
@@ -108,6 +110,20 @@ export class VaultSyncServer extends YServer {
 		if (this.documentLoaded) return;
 
 		const state = await this.getChunkedDocStore().loadState();
+		await this.recordTrace("checkpoint-load", {
+			hasCheckpoint: state.checkpoint !== null,
+			checkpointStateVectorBytes: state.checkpointStateVector?.byteLength ?? 0,
+			journalEntryCount: state.journalStats.entryCount,
+			journalBytes: state.journalStats.totalBytes,
+			replayMode:
+				state.checkpoint !== null && state.journalUpdates.length > 0
+					? "checkpoint+journal"
+					: state.checkpoint !== null
+						? "checkpoint-only"
+						: state.journalUpdates.length > 0
+							? "journal-only"
+							: "empty",
+		});
 		if (state.checkpoint) {
 			Y.applyUpdate(this.document, state.checkpoint);
 		}
@@ -141,6 +157,14 @@ export class VaultSyncServer extends YServer {
 				const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
 				const checkpointStateVector = Y.encodeStateVector(this.document);
 				await store.rewriteCheckpoint(checkpointUpdate, checkpointStateVector);
+				await this.recordTrace("checkpoint-fallback-triggered", {
+					reason: "journal-compaction-threshold-exceeded",
+					journalEntryCount: journalStats.entryCount,
+					journalBytes: journalStats.totalBytes,
+					maxJournalEntries: JOURNAL_COMPACT_MAX_ENTRIES,
+					maxJournalBytes: JOURNAL_COMPACT_MAX_BYTES,
+					note: "clients behind compaction boundary may require checkpoint-based catchup",
+				});
 				this.lastSavedStateVector = checkpointStateVector;
 				return;
 			}
@@ -177,10 +201,22 @@ export class VaultSyncServer extends YServer {
 	}
 
 	private getRoomId(): string {
-		const candidate = (this as unknown as { name?: unknown }).name;
-		return typeof candidate === "string" && candidate.length > 0
-			? candidate
-			: "unknown";
+		try {
+			const candidate = (this as unknown as { name?: unknown }).name;
+			if (typeof candidate === "string" && candidate.length > 0) {
+				return candidate;
+			}
+		} catch {
+			// Some workerd runtimes can throw while accessing `.name` before set-name.
+		}
+		return this.roomIdHint ?? "unknown";
+	}
+
+	private captureRoomIdHint(request: Request): void {
+		const headerRoom = request.headers.get("x-partykit-room");
+		if (headerRoom && headerRoom.length > 0) {
+			this.roomIdHint = headerRoom;
+		}
 	}
 }
 
