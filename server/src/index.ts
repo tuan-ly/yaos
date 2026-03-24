@@ -53,7 +53,7 @@ function withCors(response: Response): Response {
 	headers.set("Access-Control-Allow-Methods", CORS_ALLOW_METHODS);
 	headers.set("Access-Control-Expose-Headers", CORS_EXPOSE_HEADERS);
 
-	const responseWithSocket = response as Response & { webSocket?: WebSocket };
+	const responseWithSocket = response as { webSocket?: WebSocket };
 	return new Response(response.body, {
 		status: response.status,
 		statusText: response.statusText,

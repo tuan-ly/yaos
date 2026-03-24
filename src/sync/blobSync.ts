@@ -488,10 +488,10 @@ export class BlobSyncManager {
 	 *
 	 * Returns: { uploadQueued, downloadQueued, skipped }
 	 */
-	async reconcile(
+	reconcile(
 		mode: "conservative" | "authoritative",
 		excludePatterns: string[],
-	): Promise<{ uploadQueued: number; downloadQueued: number; skipped: number }> {
+	): { uploadQueued: number; downloadQueued: number; skipped: number } {
 		let uploadQueued = 0;
 		let downloadQueued = 0;
 		let skipped = 0;

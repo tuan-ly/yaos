@@ -941,7 +941,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			// Blob reconciliation (if enabled)
 			if (this.blobSync) {
-				const blobResult = await this.blobSync.reconcile(
+				const blobResult = this.blobSync.reconcile(
 					mode,
 					this.excludePatterns,
 				);
@@ -1399,7 +1399,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			id: "migrate-schema-v2",
 			name: "Migrate sync schema to v2",
 			callback: () => {
-				void this.runSchemaMigrationToV2();
+				this.runSchemaMigrationToV2();
 			},
 		});
 
@@ -1765,7 +1765,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const existingText = this.vaultSync.getTextForPath(file.path);
 
 			if (wasBound) {
-				const handledBound = await this.handleBoundFileSyncGap(
+				const handledBound = this.handleBoundFileSyncGap(
 					file,
 					content,
 					existingText,
@@ -1824,11 +1824,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return views;
 	}
 
-	private async handleBoundFileSyncGap(
+	private handleBoundFileSyncGap(
 		file: TFile,
 		content: string,
 		existingText: ReturnType<VaultSync["getTextForPath"]>,
-	): Promise<boolean> {
+	): boolean {
 		const now = Date.now();
 		const lockUntil = this.boundRecoveryLocks.get(file.path) ?? 0;
 		if (lockUntil > now) {
@@ -2536,7 +2536,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		if (runInitialReconcile) {
 			try {
-				const result = await this.blobSync.reconcile("authoritative", this.excludePatterns);
+				const result = this.blobSync.reconcile("authoritative", this.excludePatterns);
 				this.log(
 					`Attachment reconcile (${reason}): queued ` +
 					`${result.uploadQueued} uploads, ${result.downloadQueued} downloads, ${result.skipped} skipped`,
@@ -3062,7 +3062,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new Notice(`Sync diagnostics exported to ${outPath}`, 10000);
 	}
 
-	private async runSchemaMigrationToV2(): Promise<void> {
+	private runSchemaMigrationToV2(): void {
 		if (!this.vaultSync) {
 			new Notice("Sync not initialized.");
 			return;
