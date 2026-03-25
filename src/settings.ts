@@ -5,7 +5,6 @@ import { randomBase64Url } from "./utils/base64url";
 
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
-export type UpdateProvider = "github" | "gitlab" | "unknown";
 
 export interface VaultSyncSettings {
 	/** Cloudflare Worker host, e.g. "https://sync.yourdomain.com" */
@@ -39,8 +38,6 @@ export interface VaultSyncSettings {
 	attachmentConcurrency: number;
 	/** Show remote cursors and selections in the editor. */
 	showRemoteCursors: boolean;
-	/** Optional Git provider hosting the generated Cloudflare deployment repo. */
-	updateProvider: UpdateProvider | "";
 	/** Optional repo URL used to deep-link provider-native update pages. */
 	updateRepoUrl: string;
 	/** Optional default branch for provider-native update links. */
@@ -62,12 +59,11 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	// requestUrl cannot be hard-aborted; default to 1 to avoid stacked zombie transfers.
 	attachmentConcurrency: 1,
 	showRemoteCursors: true,
-	updateProvider: "",
 	updateRepoUrl: "",
 	updateRepoBranch: "main",
 };
 
-const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos-update-test-20260325/tree/main/server";
+const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
 
 /** Generate a random vault ID (16 bytes, base64url). */
 export function generateVaultId(): string {
@@ -391,7 +387,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			addCardRow(
 				updateCard,
 				"Update path",
-				updateState.updateRepoUrl ?? "Using the generic YAOS update guide",
+				updateState.updateRepoUrl ?? "Not configured",
 			);
 
 			const summaryText = updateState.serverUpdateAvailable
@@ -412,17 +408,32 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					cls: "yaos-settings-security-warning",
 				});
 			}
+			if (updateState.legacyServerDetected) {
+				updateCard.createEl("p", {
+					text: "Legacy YAOS server detected. Sync will continue, but update metadata and 1-click updater features need a newer server.",
+					cls: "yaos-settings-security-warning",
+				});
+			}
 
 			const updateActions = updateCard.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });
 			updateActions.createEl("button", { text: "Refresh update info" }).addEventListener("click", () => {
 				void this.plugin.refreshServerCapabilities("settings-refresh");
 				void this.plugin.refreshUpdateManifest("settings-refresh", true).then(() => this.display());
 			});
-			updateActions.createEl("button", {
-				text: updateState.updateActionUrl ? "Open update action" : "Open update guide",
-			}).addEventListener("click", () => {
-				window.open(updateState.updateActionUrl ?? updateState.updateGuideUrl, "_blank", "noopener");
-			});
+			const updateActionUrl = updateState.updateActionUrl;
+			if (updateActionUrl) {
+				updateActions.createEl("button", {
+					text: "Open update action",
+				}).addEventListener("click", () => {
+					window.open(updateActionUrl, "_blank", "noopener");
+				});
+			}
+			const bootstrapUrl = updateState.updateBootstrapUrl;
+			if (bootstrapUrl) {
+				updateActions.createEl("button", { text: "Initialize updater" }).addEventListener("click", () => {
+					window.open(bootstrapUrl, "_blank", "noopener");
+				});
+			}
 		}
 
 		addSectionHeading(containerEl, "This device");
@@ -631,24 +642,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			);
 
 			new Setting(advancedBody)
-				.setName("Deployment provider")
-				.setDesc("Optional. Used to deep-link the provider-native server update page.")
-				.addDropdown((dropdown) =>
-					dropdown
-						.addOption("", "Unknown")
-						.addOption("github", "GitHub")
-						.addOption("gitlab", "GitLab")
-						.setValue(this.plugin.settings.updateProvider)
-						.onChange(async (value) => {
-							this.plugin.settings.updateProvider = value as UpdateProvider | "";
-							await this.plugin.saveSettings();
-							this.display();
-						}),
-				);
-
-			new Setting(advancedBody)
 				.setName("Deployment repo URL")
-				.setDesc("Optional. Example: https://github.com/you/yaos-server")
+				.setDesc("Optional. Example: https://github.com/you/yaos-server. Provider is inferred from this URL.")
 				.addText((text) =>
 					text
 						.setPlaceholder("Paste the generated GitHub or GitLab repo URL")
