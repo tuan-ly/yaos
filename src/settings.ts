@@ -67,7 +67,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	updateRepoBranch: "main",
 };
 
-const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
+const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos-update-test-20260325/tree/main/server";
 
 /** Generate a random vault ID (16 bytes, base64url). */
 export function generateVaultId(): string {

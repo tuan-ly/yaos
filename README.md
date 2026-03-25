@@ -4,7 +4,7 @@
 
 Your notes stay in sync instantly across devices, without conflicted copies, delayed file sync, or database-heavy self-hosting.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos-update-test-20260325/tree/main/server)
 
 No terminal, no `.env` files, no database setup required. R2 is optional.
 
